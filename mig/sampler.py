@@ -26,7 +26,7 @@ class Sampler(metaclass=ABCMeta):
 
 class RandomSampler(Sampler):
     
-    def sample(self, pool: Dataset[DataPoint], num_sample: int, batch_size: int = 0) -> Iterator[DataPoint]:
+    def sample(self, pool: Dataset, num_sample: int, batch_size: int = 0) -> Iterator[DataPoint]:
         if num_sample >= len(pool):
             raise ValueError("num_sample must be less than the size of the pool.")
         import random
@@ -50,7 +50,7 @@ class IFDSampler(Sampler):
         self.upper_bound = upper_bound
         self.lower_bound = lower_bound
     
-    def filter(self, pool: Dataset[DataPoint]):
+    def filter(self, pool: Dataset):
         """Filter outilers"""
         
         filtered_pool = []
@@ -60,7 +60,7 @@ class IFDSampler(Sampler):
         
         return filtered_pool
         
-    def sample(self, pool: Dataset[DataPoint], num_sample: int, batch_size: int = 0) -> Iterator[DataPoint]:
+    def sample(self, pool: Dataset, num_sample: int, batch_size: int = 0) -> Iterator[DataPoint]:
         
         # filter
         filtered_pool = self.filter(pool)
@@ -144,6 +144,9 @@ class MIGSampler(Sampler):
         
     def sample(self, pool: Dataset, num_sample: int, batch_size: int = 0) -> Iterator[DataPoint]:
         """Sample a subset of the pool with 'num_sample' samples."""
+        if num_sample > len(pool):
+            raise ValueError("num_sample must be less than or equal to the size of the pool.")
+
         # make a copy of the pool
         pool = pool.copy()
         
@@ -187,13 +190,15 @@ class MIGSampler(Sampler):
             
             # select the data point with the maximum information gain
             idx = torch.argmax(vec_candidate)
-            indices = torch.nonzero(mask, as_tuple=False).squeeze()
+            # Keep indices 1D even when only one candidate remains.
+            indices = torch.nonzero(mask, as_tuple=True)[0]
             selected_idx = indices[idx]
             
             vec_x_sel += vec_pool_prop[selected_idx]
             mask[selected_idx] = False
             n_sel += 1
-            dp = pool.pop(idx.item())
+            # Keep pool indexing aligned with vec_pool_prop/mask by not mutating pool.
+            dp = pool[selected_idx.item()]
             
             yield dp
 

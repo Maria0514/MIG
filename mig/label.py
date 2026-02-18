@@ -81,8 +81,21 @@ class LabelGraph(metaclass=ABCMeta):
                 raise ImportError("Please install jaal to use the Jaal backend.")
             
             # construct
-            edges = pd.DataFrame([{"from": i, "to": j, "weight": 100 * self.wam[i, j]} for i in range(len(self._labels)) for j in range(i) if self.wam[i, j] > 0])
+            edge_rows = [
+                {"from": i, "to": j, "weight": float(100 * self.wam[i, j].item())}
+                for i in range(len(self._labels))
+                for j in range(i)
+                if self.wam[i, j] > 0
+            ]
+            # Keep columns even when there are no edges.
+            edges = pd.DataFrame(edge_rows, columns=["from", "to", "weight"])
             nodes = pd.DataFrame({"id": range(len(self._labels)), "title": self._labels})
+            if edges.empty:
+                print(
+                    "Warning: no edges found in label graph (off-diagonal similarity > threshold). "
+                    "Try rebuilding with a lower sim_threshold."
+                )
+                return
             
             # visualize
             port = 8050

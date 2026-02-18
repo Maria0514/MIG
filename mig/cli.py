@@ -39,6 +39,7 @@ def sample(
     prop_weight: Annotated[float, typer.Option(help="Propagation weight used in propagation matrix")] = 1.0,
     norm: Annotated[bool, typer.Option("--norm", help="Use normalize in sampler", is_flag=True)] = False,
     batch_size: Annotated[int, typer.Option(help="batch size used in sample")] = 0,
+    dump_label_graph: Annotated[Optional[Path], typer.Option("--dump-label-graph", help="Path to dump serialized label graph (.pkl)")] = None,
 ):
     """Sample data from pool"""
     
@@ -47,6 +48,10 @@ def sample(
     
     typer.echo(f"Creating label graph using {label_graph_type} label graph")
     label_graph = create_label_graph(label_graph_type, dataset=pool, load_from=load_from, embedding_model=embedding_model, sim_threshold=sim_threshold)
+    if dump_label_graph is not None:
+        dump_label_graph.parent.mkdir(parents=True, exist_ok=True)
+        label_graph.dump(str(dump_label_graph))
+        typer.echo(f"Label graph dumped to {dump_label_graph}")
     
     typer.echo(f"Creating sampler using {sampler_type} sampler")
     sampler = create_sampler(sampler_type, label_graph, phi_type, phi_alpha, phi_a, phi_b, prop_weight, norm)

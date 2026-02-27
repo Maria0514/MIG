@@ -23,19 +23,28 @@ class LabelGraph(metaclass=ABCMeta):
         self._labels: list[str] = []
         self._label_to_index: dict[str, int] = {}
         self._W: None | Tensor = None
+        self._W_raw: None | Tensor = None
     
     def load(self, filename: str):
         """Load the label graph from a file."""
-        items = ["_labels", "_label_to_index", "_W"]
+        required_items = ["_labels", "_label_to_index", "_W"]
+        optional_items = ["_W_raw", "_sim_threshold"]
         with open(filename, "rb") as f:
             data = pickle.load(f)
-            for item in items:
+            for item in required_items:
                 setattr(self, item, data[item])
+            for item in optional_items:
+                if item in data:
+                    setattr(self, item, data[item])
     
     def dump(self, filename: str):
         """Dump the label graph to a file."""
-        items = ["_labels", "_label_to_index", "_W"]
-        data = {item: getattr(self, item) for item in items}
+        required_items = ["_labels", "_label_to_index", "_W"]
+        optional_items = ["_W_raw", "_sim_threshold"]
+        data = {item: getattr(self, item) for item in required_items}
+        for item in optional_items:
+            if hasattr(self, item):
+                data[item] = getattr(self, item)
         with open(filename, "wb") as f:
             pickle.dump(data, f)
     
@@ -71,6 +80,7 @@ class LabelGraph(metaclass=ABCMeta):
             for i, label1 in enumerate(label_list):
                 for j, label2 in enumerate(label_list[:i]):
                     wam[i, j] = wam[j, i] = self.calc_weight(label1, label2)
+            return wam
     
     def visualize(self, backend: str = "jaal"):
         """Visualize the label graph."""
@@ -89,7 +99,12 @@ class LabelGraph(metaclass=ABCMeta):
             ]
             # Keep columns even when there are no edges.
             edges = pd.DataFrame(edge_rows, columns=["from", "to", "weight"])
-            nodes = pd.DataFrame({"id": range(len(self._labels)), "title": self._labels})
+            # Jaal/vis.js renders node text from the "label" column; keep numeric ids for edges.
+            nodes = pd.DataFrame({
+                "id": range(len(self._labels)),
+                "label": self._labels,
+                "title": self._labels,
+            })
             if edges.empty:
                 print(
                     "Warning: no edges found in label graph (off-diagonal similarity > threshold). "
@@ -149,33 +164,53 @@ class SimLabelGraph(LabelGraph):
     ):
         super().__init__()
         self._sim_threshold = sim_threshold
-        self._embedding_model = SentenceTransformer(embedding_model, cache_folder=embedding_cache)
+        self._embedding_model_path = embedding_model
+        self._embedding_cache = embedding_cache
+        self._embedding_model: Optional[SentenceTransformer] = None
         
         if load_from is not None:
             self.load(load_from)
+            # Fast path: if raw similarity matrix exists in pkl, threshold can be changed
+            # without recomputing embeddings.
+            if self._W_raw is not None:
+                self.rethreshold(sim_threshold)
         else:
             assert dataset is not None
+            self._embedding_model = SentenceTransformer(embedding_model, cache_folder=embedding_cache)
             self._build_from_dataset(dataset)
+
+    def rethreshold(self, sim_threshold: float) -> None:
+        """Apply a new threshold to the cached raw similarity matrix."""
+        if self._W_raw is None:
+            raise ValueError(
+                "Raw similarity matrix (_W_raw) is missing. "
+                "Rebuild graph once with current code to enable fast re-threshold."
+            )
+        self._sim_threshold = sim_threshold
+        self._W = self._W_raw.where(self._W_raw >= self._sim_threshold, 0.0)
     
     def calc_weighted_adjacency_matrix(self, label_list: list[str] | list[int]) -> torch.Tensor:
         """Calculate the weighted adjacency matrix of the label set."""
         
         label_list = [label if isinstance(label, str) else self._labels[label] for label in label_list]
         
+        if self._embedding_model is None:
+            self._embedding_model = SentenceTransformer(self._embedding_model_path, cache_folder=self._embedding_cache)
         embeddings = self._embedding_model.encode(label_list, convert_to_tensor=True, normalize_embeddings=True) # (N, D)
         
         # calculate cosine similarity for normalize embedding
-        wam = embeddings @ embeddings.T # (N, N)
+        self._W_raw = embeddings @ embeddings.T # (N, N)
         
         # set similarity below threshold to zero
-        wam = wam.where(wam >= self._sim_threshold, 0.0)
+        wam = self._W_raw.where(self._W_raw >= self._sim_threshold, 0.0)
         
         return wam
     
     def calc_weight(self, label1: str | int, label2: str | int) -> float:
         
         labels = [label if isinstance(label, str) else self._labels[label] for label in (label1, label2)]
-        
+        if self._embedding_model is None:
+            self._embedding_model = SentenceTransformer(self._embedding_model_path, cache_folder=self._embedding_cache)
         embeddings = self._embedding_model.encode(labels, convert_to_tensor=True, normalize_embeddings=True) # (2, D)
         
         sim = torch.dot(embeddings[0], embeddings[1]).item()

@@ -21,15 +21,39 @@ cd D:\study\MIG
 
 确认以下文件存在：
 
-1. 数据池：`data/annotated.jsonl`
-2. 有效标签：`configs/valid_tag_path.json`
+1. 数据池（按你的任务选择其一）：
+   - 通用示例：`data/annotated.jsonl`
+   - OpenHermes Python 池：`data/icl/openhermes_python_related.jsonl`
+2. 有效标签（按数据池对应）：
+   - 通用示例：`configs/valid_tag_path.json`
+   - OpenHermes Python 池：`configs/valid_tag_path_openhermes_python.json`
 3. 本地 embedding 模型：`models/e5-mistral-7b-instruct`
 
 ---
 
 ## 2. 采样并构建标签图
 
-### 2.1 先跑一个小样本（推荐）
+### 2.1 首次构图（必须先做一次）
+
+说明：当前代码支持“快速重阈值”，但前提是你先用**新版本代码**重建一次图，把原始相似度矩阵 `_W_raw` 写进 pkl。
+
+如果你当前用的是 OpenHermes Python 池，推荐命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m mig.cli sample data/icl/openhermes_python_related.jsonl `
+  --out outputs/openhermes_python_sample_1.jsonl `
+  --num 1 `
+  --valid-tag-path ./configs/valid_tag_path_openhermes_python.json `
+  --label-graph-type sim `
+  --embedding-model ./models/e5-mistral-7b-instruct `
+  --sim-threshold 0.8 `
+  --sampler-type random `
+  --dump-label-graph outputs/label_graph_openhermes_python_t08.pkl
+```
+
+> `--num 1` 只是把“采样写出”成本压到最小，不影响“全量标签图”构建。
+
+### 2.2 通用小样本命令（旧数据示例）
 
 ```powershell
 mig sample data/annotated.jsonl `
@@ -49,6 +73,19 @@ mig sample data/annotated.jsonl `
 1. `--sim-threshold` 越高，边越少；越低，边越多。
 2. `--dump-label-graph` 会把标签图保存为 `pkl`。
 3. `--num` 不能超过可用样本数。
+
+### 2.3 快速重阈值（不重跑 embedding）
+
+当 pkl 内含 `_W_raw` 后，可以直接重设阈值：
+
+```powershell
+.\.venv\Scripts\python.exe utils/rethreshold_label_graph.py `
+  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
+  --sim-threshold 0.9 `
+  --out-pkl outputs/label_graph_openhermes_python_t09.pkl
+```
+
+这一步只做阈值裁剪，不会再次跑 embedding 模型。
 
 ---
 
@@ -80,10 +117,10 @@ mig sample data/annotated.jsonl `
 
 ```powershell
 .\.venv\Scripts\python.exe utils/export_wam_from_pkl.py `
-  --graph-pkl outputs/label_graph_t06.pkl `
-  --out-csv outputs/wam_t06.csv `
-  --out-npy outputs/wam_t06.npy `
-  --labels-out outputs/labels_t06.txt
+  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
+  --out-csv outputs/wam_openhermes_python_t08.csv `
+  --out-npy outputs/wam_openhermes_python_t08.npy `
+  --labels-out outputs/labels_openhermes_python_t08.txt
 ```
 
 输出说明：
@@ -127,32 +164,44 @@ mig sample data/annotated.jsonl `
 1. 优先检查 `pkl` 是否由当前版本代码导出。
 2. 降低 `--sim-threshold` 重建图。
 
+### 6.5 `Raw similarity matrix (_W_raw) is missing`
+
+你正在对旧版 pkl 使用“快速重阈值”。旧版 pkl 只保存了阈值后的 `_W`，没有 `_W_raw`。
+
+处理方法：
+
+1. 用当前代码先跑一次 `mig sample ... --dump-label-graph ...` 重新构图。
+2. 之后再用 `utils/rethreshold_label_graph.py` 快速调阈值。
+
 ---
 
-## 7. 一条完整演示命令链
+## 7. 一条完整演示命令链（OpenHermes）
 
 ```powershell
 cd D:\study\MIG
 .\.venv\Scripts\Activate.ps1
 
-mig sample data/annotated.jsonl `
-  --out outputs/mig_sample_5_t06.jsonl `
-  --num 5 `
-  --valid-tag-path ./configs/valid_tag_path.json `
+.\.venv\Scripts\python.exe -m mig.cli sample data/icl/openhermes_python_related.jsonl `
+  --out outputs/openhermes_python_sample_1.jsonl `
+  --num 1 `
+  --valid-tag-path ./configs/valid_tag_path_openhermes_python.json `
   --label-graph-type sim `
   --embedding-model ./models/e5-mistral-7b-instruct `
-  --sim-threshold 0.6 `
-  --sampler-type mig `
-  --batch-size 4096 `
-  --dump-label-graph outputs/label_graph_t06.pkl
+  --sim-threshold 0.8 `
+  --sampler-type random `
+  --dump-label-graph outputs/label_graph_openhermes_python_t08.pkl
+
+.\.venv\Scripts\python.exe utils/rethreshold_label_graph.py `
+  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
+  --sim-threshold 0.9 `
+  --out-pkl outputs/label_graph_openhermes_python_t09.pkl
 
 .\.venv\Scripts\python.exe utils/visualize_label_graph.py `
-  --graph-pkl outputs/label_graph_t06.pkl
+  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl
 
 .\.venv\Scripts\python.exe utils/export_wam_from_pkl.py `
-  --graph-pkl outputs/label_graph_t06.pkl `
-  --out-csv outputs/wam_t06.csv `
-  --out-npy outputs/wam_t06.npy `
-  --labels-out outputs/labels_t06.txt
+  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
+  --out-csv outputs/wam_openhermes_python_t08.csv `
+  --out-npy outputs/wam_openhermes_python_t08.npy `
+  --labels-out outputs/labels_openhermes_python_t08.txt
 ```
-

@@ -5,6 +5,7 @@ from typing import Optional
 from typing_extensions import Annotated
 
 from .data import load_dataset, dump_dataset
+from .icl_data import build_icl_datasets
 from .label import LabelGraphType, create_label_graph
 from .sampler import SamplerType, create_sampler
 
@@ -19,6 +20,26 @@ cli = typer.Typer(
 @cli.command("hello")
 def hello():
     typer.echo("Hello World")
+
+
+@cli.command("build-icl-data")
+def build_icl_data(
+    out_dir: Annotated[Path, typer.Option(help="Output directory for ICL datasets")] = Path("data/icl"),
+    mbpp_src: Annotated[Optional[Path], typer.Option(help="Local MBPP source file (.json/.jsonl/.jsonl.gz)")] = None,
+    humaneval_src: Annotated[Optional[Path], typer.Option(help="Local HumanEval source file (.json/.jsonl/.jsonl.gz)")] = None,
+    mbpp_config: Annotated[str, typer.Option(help="MBPP config name")] = "sanitized",
+    overwrite: Annotated[bool, typer.Option("--overwrite", help="Overwrite existing output files", is_flag=True)] = False,
+):
+    """Build ICL datasets: MBPP candidate pool and HumanEval eval set."""
+    result = build_icl_datasets(
+        out_dir=out_dir,
+        mbpp_src=mbpp_src,
+        humaneval_src=humaneval_src,
+        mbpp_config=mbpp_config,
+        overwrite=overwrite,
+    )
+    typer.echo(f"MBPP candidate pool: {result.mbpp_count} -> {result.mbpp_path}")
+    typer.echo(f"HumanEval eval set: {result.humaneval_count} -> {result.humaneval_path}")
     
 
 @cli.command("sample")

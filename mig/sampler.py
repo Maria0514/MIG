@@ -209,5 +209,4 @@ def create_sampler(sampler_type: SamplerType, label_graph: Optional[LabelGraph],
             raise ValueError("label_graph must be provided for MIG sampler.")
         return MIGSampler(label_graph, phi_type=phi_type, phi_alpha=phi_alpha, phi_a=phi_a, phi_b=phi_b, prop_weight=prop_weight, norm=norm)
     elif sampler_type == SamplerType.RANDOM:
-        return RandomSampler()
-    
+        return RandomSampler()2

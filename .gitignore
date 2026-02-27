@@ -125,3 +125,5 @@ cache
 
 models/
 outputs/
+data/
+tmp/

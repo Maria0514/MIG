@@ -59,6 +59,17 @@ def sample(
     phi_b: Annotated[float, typer.Option(help="Exponent to use in pow phi")] = 0.8,
     prop_weight: Annotated[float, typer.Option(help="Propagation weight used in propagation matrix")] = 1.0,
     norm: Annotated[bool, typer.Option("--norm", help="Use normalize in sampler", is_flag=True)] = False,
+    use_difficulty_penalty: Annotated[
+        bool,
+        typer.Option(
+            "--use-difficulty-penalty/--no-use-difficulty-penalty",
+            help="Toggle difficulty penalty interface (scoring logic not implemented yet).",
+        ),
+    ] = False,
+    difficulty_penalty_weight: Annotated[
+        float,
+        typer.Option(help="Difficulty penalty weight placeholder (used when interface is enabled)."),
+    ] = 0.0,
     batch_size: Annotated[int, typer.Option(help="batch size used in sample")] = 0,
     dump_label_graph: Annotated[Optional[Path], typer.Option("--dump-label-graph", help="Path to dump serialized label graph (.pkl)")] = None,
 ):
@@ -75,7 +86,18 @@ def sample(
         typer.echo(f"Label graph dumped to {dump_label_graph}")
     
     typer.echo(f"Creating sampler using {sampler_type} sampler")
-    sampler = create_sampler(sampler_type, label_graph, phi_type, phi_alpha, phi_a, phi_b, prop_weight, norm)
+    sampler = create_sampler(
+        sampler_type,
+        label_graph,
+        phi_type,
+        phi_alpha,
+        phi_a,
+        phi_b,
+        prop_weight,
+        norm,
+        use_difficulty_penalty=use_difficulty_penalty,
+        difficulty_penalty_weight=difficulty_penalty_weight,
+    )
     
     sampled = sampler.sample(pool, num_sample, batch_size=batch_size)
     

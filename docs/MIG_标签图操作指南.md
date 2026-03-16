@@ -1,12 +1,13 @@
 # MIG 标签图操作指南
 
-本文档整理了在 `D:\study\MIG` 项目中，围绕标签图（Label Graph）的完整操作流程：
+本文档整理了在 `D:\study\MIG` 项目中，围绕标签图（Label Graph）与 ICL 示例选择的完整操作流程：
 
 1. 采样并构建标签图
 2. 导出标签图 `pkl`
 3. 可视化标签图（节点/边）
 4. 导出权重矩阵（WAM）
-5. 常见问题排查
+5. 运行示例选择（`query_id -> ordered_demo_ids`）
+6. 常见问题排查
 
 ---
 
@@ -205,3 +206,130 @@ cd D:\study\MIG
   --out-npy outputs/wam_openhermes_python_t08.npy `
   --labels-out outputs/labels_openhermes_python_t08.txt
 ```
+---
+
+## 8. 运行示例选择（Query -> Demo）
+
+本节用于跑通 query-aware ICL 选例流程，输出 `query_id -> ordered_demo_ids`。
+
+### 8.1 前置输入
+
+需要以下文件：
+
+1. 候选池：`data/icl/openhermes_python_related.jsonl`
+2. query 集（已打标签）：`data/icl/humaneval_eval_tagged.jsonl`
+3. 标签图：`outputs/label_graph_openhermes_python_t08.pkl`
+4. 有效标签表：`configs/valid_tag_path_openhermes_python.json`
+
+### 8.2 小规模联调（建议先跑）
+
+```powershell
+.\.venv\Scripts\python.exe utils/select_icl_examples.py `
+  --pool data/icl/openhermes_python_related.jsonl `
+  --queries data/icl/humaneval_eval_tagged.jsonl `
+  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
+  --valid-tag-path configs/valid_tag_path_openhermes_python.json `
+  --out data/icl/mappings/humaneval_to_demos_demo3.jsonl `
+  --k 8 `
+  --tau-q 0.8 `
+  --phi-type pow `
+  --phi-a 1e-6 `
+  --phi-b 0.6 `
+  --lambda-quality 0.1 `
+  --lambda-len 0.05 `
+  --lambda-red 0.1 `
+  --lambda-diff 0.0 `
+  --prop-weight 1.0 `
+  --query-limit 3 `
+  --with-debug-scores
+```
+
+说明：
+
+1. `--query-limit 3` 只跑前 3 条 query，用于快速检查流程。
+2. `--with-debug-scores` 会在输出里附带每一步打分拆解。
+
+### 8.3 全量运行（164 条 HumanEval）
+
+```powershell
+.\.venv\Scripts\python.exe utils/select_icl_examples.py `
+  --pool data/icl/openhermes_python_related.jsonl `
+  --queries data/icl/humaneval_eval_tagged.jsonl `
+  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
+  --valid-tag-path configs/valid_tag_path_openhermes_python.json `
+  --out data/icl/mappings/humaneval_to_demos.jsonl `
+  --k 8 `
+  --tau-q 0.8 `
+  --phi-type pow `
+  --phi-a 1e-6 `
+  --phi-b 0.6 `
+  --lambda-quality 0.1 `
+  --lambda-len 0.05 `
+  --lambda-red 0.1 `
+  --lambda-diff 0.0 `
+  --prop-weight 1.0
+```
+
+### 8.4 结果与参数记录
+
+全量运行后建议检查并保存：
+
+1. 映射结果：`data/icl/mappings/humaneval_to_demos.jsonl`
+2. 元数据记录：`data/icl/metadata/humaneval_to_demos.meta.json`
+
+元数据中包含：输入路径、超参数、运行名、输出统计（例如 query 覆盖率、每条 K 值、是否有重复 demo）。
+
+---
+
+## 9. 评测闭环（Prompt 组装 -> API 推理 -> HumanEval 评测）
+
+本节用于跑通完整评测链路，并将每次运行产物归档到独立目录。
+
+### 9.1 组装 `k=5` 的评测 Prompt
+
+```powershell
+.\.venv\Scripts\python.exe utils/build_icl_prompts.py `
+  --k 5 `
+  --out data/icl/eval_prompts/mig_humaneval_k5.jsonl
+```
+
+### 9.2 调用 SiliconFlow API（DeepSeek-V3.2）
+
+脚本默认读取 `.env` 中的 `SILICONFLOW_API_KEY`，并使用：
+- `base_url = https://api.siliconflow.cn/v1`
+- `model = deepseek-ai/DeepSeek-V3.2`
+
+```powershell
+.\.venv\Scripts\python.exe utils/run_api_infer.py `
+  --prompts data/icl/eval_prompts/mig_humaneval_k5.jsonl `
+  --run-name v32_mig_k5_full `
+  --parallelism 4 `
+  --rate-limit-qps 1.0 `
+  --bucket-capacity 2.0
+```
+
+输出目录：
+- `data/icl/eval_outputs/v32_mig_k5_full/outputs.jsonl`
+- `data/icl/eval_outputs/v32_mig_k5_full/run_manifest.json`
+
+### 9.3 执行 HumanEval 自动评测
+
+```powershell
+.\.venv\Scripts\python.exe utils/eval_humaneval.py `
+  --inference data/icl/eval_outputs/v32_mig_k5_full/outputs.jsonl `
+  --prompts data/icl/eval_prompts/mig_humaneval_k5.jsonl `
+  --k-list 1,5 `
+  --run-name v32_mig_k5_full_eval
+```
+
+输出目录：
+- `data/icl/eval_metrics/v32_mig_k5_full_eval/summary.json`
+- `data/icl/eval_metrics/v32_mig_k5_full_eval/per_query.jsonl`
+- `data/icl/eval_metrics/v32_mig_k5_full_eval/per_sample.jsonl`
+- `data/icl/eval_metrics/v32_mig_k5_full_eval/run_manifest.json`
+
+### 9.4 本次会话结果（2026-03-15）
+
+1. 全量 164 条推理成功（`written_ok=164, written_error=0`）。
+2. `pass@1 = 0.8537`（`140/164`）。
+3. 当前每题 1 个 completion；`pass@5` 需多采样后再统计。

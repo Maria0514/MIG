@@ -333,3 +333,57 @@ cd D:\study\MIG
 1. 全量 164 条推理成功（`written_ok=164, written_error=0`）。
 2. `pass@1 = 0.8537`（`140/164`）。
 3. 当前每题 1 个 completion；`pass@5` 需多采样后再统计。
+
+---
+
+## 10. Baseline 对照组（Zero / Random / Similarity）
+
+### 10.1 生成 baseline 映射
+
+```powershell
+.\.venv\Scripts\python.exe utils/build_baseline_mappings.py `
+  --method zero `
+  --k 0 `
+  --out data/icl/mappings/humaneval_zero_k0.jsonl
+
+.\.venv\Scripts\python.exe utils/build_baseline_mappings.py `
+  --method random `
+  --k 5 `
+  --seed 42 `
+  --out data/icl/mappings/humaneval_random_k5.jsonl
+
+.\.venv\Scripts\python.exe utils/build_baseline_mappings.py `
+  --method sim `
+  --k 5 `
+  --embedding-model models/e5-mistral-7b-instruct `
+  --embedding-device cpu `
+  --embedding-batch-size 1 `
+  --pool-emb-cache data/icl/cache/openhermes_e5m7b_pool_emb_f16.npy `
+  --embedding-dtype float16 `
+  --out data/icl/mappings/humaneval_sim_k5.jsonl
+```
+
+### 10.2 评测两条常用路径
+
+1. 分步执行：`build_icl_prompts.py -> run_api_infer.py -> eval_humaneval.py`
+2. 一键执行：`utils/run_baseline_pipeline.py`
+
+```powershell
+.\.venv\Scripts\python.exe utils/run_baseline_pipeline.py `
+  --methods zero,random,sim `
+  --k 5 `
+  --run-prefix v32_baseline `
+  --embedding-device cpu `
+  --embedding-batch-size 1 `
+  --pool-emb-cache data/icl/cache/openhermes_e5m7b_pool_emb_f16.npy
+```
+
+### 10.3 相似度基线常见卡住现象
+
+症状：`Batches` 长时间显示 `0%`，CPU 低、内存高。  
+解释：CPU 下运行 7B embedding 模型，常见内存压力与换页导致吞吐极低。  
+建议：
+
+1. 优先在 VM/GPU 环境跑 `Similarity-ICL`。
+2. 保留 `--pool-emb-cache`，让候选池 embedding 一次编码、多次复用。
+3. 先小规模验证（`query-limit` / `pool-limit`），再全量运行。

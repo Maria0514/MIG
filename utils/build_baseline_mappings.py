@@ -31,6 +31,16 @@ def write_json(path: Path, obj: dict[str, Any]) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
+def read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
 def resolve_demo_id(raw: dict[str, Any], pool_index: int) -> str:
     for key in ("demo_id", "id", "_id"):
         value = raw.get(key)
@@ -152,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional .npy cache for pool embeddings (similarity baseline).",
     )
     parser.add_argument(
+        "--query-emb-cache",
+        type=Path,
+        default=None,
+        help="Optional .npy cache for query embeddings (similarity baseline).",
+    )
+    parser.add_argument(
         "--embedding-dtype",
         type=str,
         choices=("float32", "float16"),
@@ -242,7 +258,7 @@ def _encode_texts(
 
 def load_or_build_pool_embeddings(
     *,
-    model: Any,
+    model: Any | None,
     pool_texts: list[str],
     batch_size: int,
     cache_path: Path | None,
@@ -259,6 +275,9 @@ def load_or_build_pool_embeddings(
             emb = emb.astype(np_dtype, copy=False)
         return emb
 
+    if model is None:
+        raise ValueError("Pool embedding cache unavailable; model is required to build pool embeddings.")
+
     emb = _encode_texts(
         model=model,
         texts=pool_texts,
@@ -273,6 +292,69 @@ def load_or_build_pool_embeddings(
     return emb
 
 
+def load_or_build_query_embeddings(
+    *,
+    model: Any | None,
+    query_ids: list[str],
+    query_texts: list[str],
+    batch_size: int,
+    prompt_name: str,
+    prompt: str,
+    cache_path: Path | None,
+    dtype: str,
+) -> np.ndarray:
+    np_dtype = np.float16 if dtype == "float16" else np.float32
+    meta_path = None if cache_path is None else cache_path.with_suffix(cache_path.suffix + ".meta.json")
+
+    if cache_path is not None and cache_path.exists() and meta_path is not None and meta_path.exists():
+        emb = np.load(cache_path)
+        meta = read_json(meta_path)
+        cached_ids = meta.get("query_ids")
+        if not isinstance(cached_ids, list):
+            raise ValueError(f"Invalid query cache meta: {meta_path}")
+        if emb.ndim != 2 or emb.shape[0] != len(query_ids):
+            raise ValueError(
+                f"Invalid query cache shape {emb.shape}; expected ({len(query_ids)}, dim). Remove cache and retry."
+            )
+        if [str(x) for x in cached_ids] != query_ids:
+            raise ValueError(
+                "Query cache ids mismatch with current query set/order. "
+                f"Cache: {cache_path}, Meta: {meta_path}. Remove cache and retry."
+            )
+        if emb.dtype != np_dtype:
+            emb = emb.astype(np_dtype, copy=False)
+        print(f"Loaded query embeddings from cache: {cache_path}")
+        return emb
+
+    if model is None:
+        raise ValueError("Query embedding cache unavailable; model is required to build query embeddings.")
+
+    emb = _encode_texts(
+        model=model,
+        texts=query_texts,
+        batch_size=batch_size,
+        prompt_name=prompt_name if prompt_name else None,
+        prompt=prompt if prompt else None,
+    )
+    emb = emb.astype(np_dtype, copy=False)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_path, emb)
+        if meta_path is not None:
+            write_json(
+                meta_path,
+                {
+                    "query_ids": query_ids,
+                    "shape": [int(x) for x in emb.shape],
+                    "dtype": str(emb.dtype),
+                    "prompt_name": prompt_name,
+                    "prompt": prompt,
+                },
+            )
+        print(f"Saved query embeddings cache: {cache_path}")
+    return emb
+
+
 def build_similarity_rows(
     queries: list[dict[str, Any]],
     query_id_key: str,
@@ -280,12 +362,14 @@ def build_similarity_rows(
     pool_ids: list[str],
     pool_embeddings: np.ndarray,
     *,
-    model: Any,
+    model: Any | None,
     k: int,
     batch_size: int,
     query_prompt_name: str,
     query_prompt: str,
     query_text_max_chars: int,
+    query_emb_cache: Path | None,
+    embedding_dtype: str,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     pool_size = len(pool_ids)
@@ -300,12 +384,15 @@ def build_similarity_rows(
 
     qids = [x[0] for x in query_pairs]
     q_texts = [x[1] for x in query_pairs]
-    q_embeddings = _encode_texts(
+    q_embeddings = load_or_build_query_embeddings(
         model=model,
-        texts=q_texts,
+        query_ids=qids,
+        query_texts=q_texts,
         batch_size=batch_size,
-        prompt_name=query_prompt_name if query_prompt_name else None,
-        prompt=query_prompt if query_prompt else None,
+        prompt_name=query_prompt_name,
+        prompt=query_prompt,
+        cache_path=query_emb_cache,
+        dtype=embedding_dtype,
     )
     q_embeddings = q_embeddings.astype(pool_embeddings.dtype, copy=False)
 
@@ -373,33 +460,76 @@ def main() -> None:
             seed=args.seed,
         )
     elif method == "sim":
-        from sentence_transformers import SentenceTransformer
+        pool_embeddings: np.ndarray | None = None
+        out_rows: list[dict[str, Any]] | None = None
 
-        model = SentenceTransformer(args.embedding_model, device=args.embedding_device)
-        if args.embedding_max_seq_length > 0:
-            model.max_seq_length = args.embedding_max_seq_length
+        can_try_cache_only = (
+            args.pool_emb_cache is not None
+            and args.query_emb_cache is not None
+            and args.pool_emb_cache.exists()
+            and args.query_emb_cache.exists()
+            and args.query_emb_cache.with_suffix(args.query_emb_cache.suffix + ".meta.json").exists()
+        )
+        if can_try_cache_only:
+            try:
+                # Cache-only fast path: skip loading the embedding model when both caches are valid.
+                pool_embeddings = load_or_build_pool_embeddings(
+                    model=None,
+                    pool_texts=[""] * len(pool),
+                    batch_size=args.embedding_batch_size,
+                    cache_path=args.pool_emb_cache,
+                    dtype=args.embedding_dtype,
+                )
+                out_rows = build_similarity_rows(
+                    queries=queries,
+                    query_id_key=args.query_id_key,
+                    query_text_keys=query_text_keys,
+                    pool_ids=pool_ids,
+                    pool_embeddings=pool_embeddings,
+                    model=None,
+                    k=args.k,
+                    batch_size=args.embedding_batch_size,
+                    query_prompt_name=args.similarity_query_prompt_name,
+                    query_prompt=args.similarity_query_prompt,
+                    query_text_max_chars=args.query_text_max_chars,
+                    query_emb_cache=args.query_emb_cache,
+                    embedding_dtype=args.embedding_dtype,
+                )
+                print("Loaded pool/query embeddings from cache. Skipped embedding model loading.")
+            except Exception as e:
+                print(f"Cache-only path unavailable: {e}")
+                print("Falling back to embedding model loading.")
 
-        pool_texts = [truncate_text(extract_demo_problem(raw), args.pool_text_max_chars) for raw in pool]
-        pool_embeddings = load_or_build_pool_embeddings(
-            model=model,
-            pool_texts=pool_texts,
-            batch_size=args.embedding_batch_size,
-            cache_path=args.pool_emb_cache,
-            dtype=args.embedding_dtype,
-        )
-        out_rows = build_similarity_rows(
-            queries=queries,
-            query_id_key=args.query_id_key,
-            query_text_keys=query_text_keys,
-            pool_ids=pool_ids,
-            pool_embeddings=pool_embeddings,
-            model=model,
-            k=args.k,
-            batch_size=args.embedding_batch_size,
-            query_prompt_name=args.similarity_query_prompt_name,
-            query_prompt=args.similarity_query_prompt,
-            query_text_max_chars=args.query_text_max_chars,
-        )
+        if out_rows is None:
+            from sentence_transformers import SentenceTransformer
+
+            model = SentenceTransformer(args.embedding_model, device=args.embedding_device)
+            if args.embedding_max_seq_length > 0:
+                model.max_seq_length = args.embedding_max_seq_length
+
+            pool_texts = [truncate_text(extract_demo_problem(raw), args.pool_text_max_chars) for raw in pool]
+            pool_embeddings = load_or_build_pool_embeddings(
+                model=model,
+                pool_texts=pool_texts,
+                batch_size=args.embedding_batch_size,
+                cache_path=args.pool_emb_cache,
+                dtype=args.embedding_dtype,
+            )
+            out_rows = build_similarity_rows(
+                queries=queries,
+                query_id_key=args.query_id_key,
+                query_text_keys=query_text_keys,
+                pool_ids=pool_ids,
+                pool_embeddings=pool_embeddings,
+                model=model,
+                k=args.k,
+                batch_size=args.embedding_batch_size,
+                query_prompt_name=args.similarity_query_prompt_name,
+                query_prompt=args.similarity_query_prompt,
+                query_text_max_chars=args.query_text_max_chars,
+                query_emb_cache=args.query_emb_cache,
+                embedding_dtype=args.embedding_dtype,
+            )
     else:
         raise ValueError(f"Unsupported method: {method}")
 
@@ -428,6 +558,7 @@ def main() -> None:
                 "query_prompt_name": args.similarity_query_prompt_name,
                 "query_prompt": args.similarity_query_prompt,
                 "pool_emb_cache": str(args.pool_emb_cache) if args.pool_emb_cache else "",
+                "query_emb_cache": str(args.query_emb_cache) if args.query_emb_cache else "",
                 "embedding_dtype": args.embedding_dtype,
                 "pool_text_max_chars": args.pool_text_max_chars,
                 "query_text_max_chars": args.query_text_max_chars,

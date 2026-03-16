@@ -83,18 +83,37 @@
 - 输出：`summary.json`、`per_query.jsonl`、`per_sample.jsonl`、`run_manifest.json`
 - 产物示例：`data/icl/eval_metrics/v32_mig_k5_full_eval`
 
-## 下一步 TODO（按优先级）
-更新日期：`2026-03-15`
+14. 实现 baseline 选例脚本（Zero / Random / Similarity）[已完成]
+- 脚本：`utils/build_baseline_mappings.py`
+- 已支持方法：
+  - `zero`：空示例（`k=0`）
+  - `random`：固定种子随机选 `k`
+  - `sim`：文本 embedding 检索 top-k（`sentence-transformers`）
+- 已支持候选池 embedding 缓存：`--pool-emb-cache`（复跑可复用，不重复编码）。
 
-1. [ ] 产出最小对比结果：`Random` vs `Similarity` vs `MIG-ICL`（同模型同预算）。
-2. [ ] 增加多采样评测（每题 `n>=5`），生成有效 `pass@5`。
-3. [ ] 补全消融结果（`lambda_len/lambda_red/lambda_diff`、`k`、提示词裁剪策略）。
-4. [ ] （可选）增加 `mig select-icl` CLI 子命令（当前为 `utils/select_icl_examples.py`）。
+15. 实现 baseline 一键评测编排脚本 [已完成（可用 dry-run 冒烟）]
+- 脚本：`utils/run_baseline_pipeline.py`
+- 流程：`mapping -> prompt 组装 -> API 推理 -> HumanEval 评测 -> 报告汇总（json/csv/md）`
+- 适用方法：`zero, random, sim`
+
+## 下一步 TODO（按优先级）
+更新日期：`2026-03-16`
+
+1. [ ] 产出最小对比结果：`Zero` vs `Random` vs `Similarity` vs `MIG-ICL`（同模型同预算）。
+2. [ ] 在可用算力环境（建议 VM/GPU）完成 `Similarity-ICL` 全量运行并落盘：
+   - `data/icl/mappings/humaneval_sim_k5.jsonl`
+   - `data/icl/eval_outputs/v32_sim_k5_full`
+   - `data/icl/eval_metrics/v32_sim_k5_full_eval`
+3. [ ] 汇总四组对比报告（`markdown/csv`），补齐 `docs/评测方案.md` 模板表格。
+4. [ ] 增加多采样评测（每题 `n>=5`），生成有效 `pass@5`（strict/estimator）。
+5. [ ] 补全消融结果（`lambda_len/lambda_red/lambda_diff`、`k`、提示词裁剪策略）。
+6. [ ] （可选）增加 `mig select-icl` CLI 子命令（当前为 `utils/select_icl_examples.py`）。
 
 ## 本阶段状态
-- 已完成：全量 164 条 query 映射、prompt 组装、API 推理、自动评测闭环。
-- 未完成：多基线对比、多采样 `pass@k` 与系统化消融报告。
+- 已完成：MIG 全链路闭环；baseline 选例脚本（`zero/random/sim`）；baseline 一键评测编排脚本。
+- 未完成：`Similarity` 全量结果、四组正式横向对比、多采样 `pass@k` 与系统化消融报告。
 
 ## 备注
 - 当前仓库只消费预标注的 `instag` 和 `deita`，不内置 tagger/scorer 推理过程。
 - 新增配置与输出尽量放在 `configs/` 和 `data/icl/`，方便复现。
+- `pass@5` 在每题仅 1 个 completion 时不具备统计意义；此时仅 `pass@1` 有效，`pass@5_topk_any_available` 会退化为 `pass@1`。

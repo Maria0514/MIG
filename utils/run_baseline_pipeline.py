@@ -27,6 +27,25 @@ def load_json(path: Path) -> dict[str, Any]:
     return {}
 
 
+def load_eval_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return load_json(path)
+
+
+def method_k_from_config(config: dict[str, Any], method: str) -> int | None:
+    section = config.get("icl_eval")
+    if not isinstance(section, dict):
+        section = config
+    kb = section.get("k_by_method")
+    if not isinstance(kb, dict):
+        return None
+    raw = kb.get(method)
+    if isinstance(raw, int) and raw >= 0:
+        return raw
+    return None
+
+
 def parse_methods(text: str) -> list[str]:
     methods: list[str] = []
     for raw in text.split(","):
@@ -97,6 +116,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--methods", type=str, default="zero,random,sim")
     parser.add_argument("--k", type=int, default=5)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/icl_eval_config.json"),
+        help="Optional experiment config. When k_by_method exists, it overrides --k per method.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--query-limit", type=int, default=0)
     parser.add_argument("--pool-limit", type=int, default=0)
@@ -121,7 +146,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=0,
+        help="Override max_tokens for every request. <=0 means use prompt/config task defaults.",
+    )
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--retry", type=int, default=2)
     parser.add_argument("--retry-backoff-s", type=float, default=2.0)
@@ -213,6 +243,7 @@ def build_common_map_cmd(args: argparse.Namespace, method: str, k_eff: int, out_
 def main() -> None:
     args = parse_args()
     methods = parse_methods(args.methods)
+    eval_config = load_eval_config(args.config)
     timestamp = args.timestamp.strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
 
     report_rows: list[dict[str, Any]] = []
@@ -221,6 +252,7 @@ def main() -> None:
         "timestamp": timestamp,
         "methods": methods,
         "k": args.k,
+        "config": str(args.config),
         "query_limit": args.query_limit,
         "pool_limit": args.pool_limit,
         "dry_run_infer": args.dry_run_infer,
@@ -230,7 +262,8 @@ def main() -> None:
     }
 
     for method in methods:
-        method_k = 0 if method == "zero" else args.k
+        cfg_k = method_k_from_config(eval_config, method)
+        method_k = cfg_k if cfg_k is not None else (0 if method == "zero" else args.k)
         map_name = f"humaneval_{method}_k{method_k}.jsonl"
         mapping_path = args.mapping_dir / map_name
         meta_path = args.mapping_dir / f"{map_name}.meta.json"
@@ -265,6 +298,8 @@ def main() -> None:
                 str(args.queries),
                 "--mapping",
                 str(mapping_path),
+                "--config",
+                str(args.config),
                 "--k",
                 str(method_k),
                 "--out",
@@ -298,8 +333,6 @@ def main() -> None:
                 str(args.temperature),
                 "--top-p",
                 str(args.top_p),
-                "--max-tokens",
-                str(args.max_tokens),
                 "--timeout-s",
                 str(args.timeout_s),
                 "--retry",
@@ -312,7 +345,11 @@ def main() -> None:
                 str(args.rate_limit_qps),
                 "--bucket-capacity",
                 str(args.bucket_capacity),
+                "--config",
+                str(args.config),
             ]
+            if args.max_tokens > 0:
+                infer_cmd.extend(["--max-tokens", str(args.max_tokens)])
             if args.save_raw_response:
                 infer_cmd.append("--save-raw-response")
             if args.dry_run_infer:

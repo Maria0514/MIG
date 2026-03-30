@@ -329,7 +329,13 @@ class QueryAwareICLSelector:
 
             q_term = self.quality_norm[active_indices]
             l_term = self.len_penalty[active_indices]
-            score = score + float(lambda_quality) * q_term - float(lambda_len) * l_term
+            # Product-mode length penalty (design doc "修正后的 DEITA"):
+            # quality_eff = quality * exp(-beta * length)
+            # where beta is mapped from lambda_len, and length is normalized.
+            if float(lambda_len) < 0.0:
+                raise ValueError("lambda_len must be non-negative in product-mode length penalty.")
+            q_eff = q_term * torch.exp(-float(lambda_len) * l_term)
+            score = score + float(lambda_quality) * q_eff
 
             red_term = torch.zeros_like(score)
             if selected and lambda_red > 0.0:

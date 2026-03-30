@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -10,6 +11,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+if __package__ in (None, ""):
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from mig.icl_config import detect_prompt_task, load_eval_config, resolve_generation_profile
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -105,13 +111,49 @@ _FENCE_RE = re.compile(r"^\s*```[^\n`]*\n?(.*?)\n?```\s*$", re.DOTALL)
 
 
 def strip_code_fence(text: str) -> str:
-    src = (text or "").strip()
-    if not src:
+    src = "" if text is None else str(text)
+    if not src.strip():
         return ""
-    m = _FENCE_RE.match(src)
+    probe = src.strip()
+    m = _FENCE_RE.match(probe)
     if m:
-        return m.group(1).strip()
-    return src
+        # Keep leading indentation in code body; only trim trailing line breaks.
+        return m.group(1).rstrip("\r\n")
+    if probe.startswith("```"):
+        first_newline = probe.find("\n")
+        if first_newline >= 0:
+            return probe[first_newline + 1 :].lstrip("\r\n")
+        return ""
+    return src.rstrip("\r\n")
+
+
+def resolve_row_generation_config(
+    row: dict[str, Any],
+    *,
+    args: argparse.Namespace,
+    eval_config: dict[str, Any],
+) -> tuple[str, dict[str, Any], int]:
+    prompt_task = str(row.get("prompt_task", "")).strip()
+    if not prompt_task:
+        prompt_task = detect_prompt_task(row)
+
+    _, resolved_profile = resolve_generation_profile(eval_config, prompt_task)
+    row_profile = row.get("generation_config")
+    if isinstance(row_profile, dict):
+        max_tokens = row_profile.get("max_tokens")
+        if isinstance(max_tokens, float):
+            max_tokens = int(max_tokens)
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            resolved_profile["max_tokens"] = max_tokens
+
+    if args.max_tokens > 0:
+        resolved_profile["max_tokens"] = args.max_tokens
+
+    max_tokens = resolved_profile.get("max_tokens", 0)
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        max_tokens = 0
+
+    return str(prompt_task), resolved_profile, max_tokens
 
 
 def post_chat_completions(
@@ -172,11 +214,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run API inference from prompt JSONL using SiliconFlow-compatible chat completions with parallel workers and token-bucket rate limit."
     )
-    parser.add_argument("--prompts", type=Path, default=Path("data/icl/eval_prompts/mig_humaneval_k8.jsonl"))
+    parser.add_argument("--prompts", type=Path, default=Path("data/icl/eval_prompts/mig_humaneval_k5.jsonl"))
     parser.add_argument("--out", type=Path, default=None, help="Optional explicit output JSONL path.")
     parser.add_argument("--base-out-dir", type=Path, default=Path("data/icl/eval_outputs"))
     parser.add_argument("--run-name", type=str, default="", help="Optional run name. If empty, auto-generated.")
     parser.add_argument("--out-file-name", type=str, default="outputs.jsonl")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/icl_eval_config.json"),
+        help="Optional experiment config for task-aware generation defaults.",
+    )
 
     parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-V3.2")
     parser.add_argument("--base-url", type=str, default="https://api.siliconflow.cn/v1")
@@ -200,7 +248,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=0,
+        help="Override max_tokens for every request. <=0 means use prompt/config task defaults.",
+    )
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--retry", type=int, default=2)
     parser.add_argument("--retry-backoff-s", type=float, default=2.0)
@@ -229,6 +282,7 @@ def infer_one(
     row: dict[str, Any],
     *,
     args: argparse.Namespace,
+    eval_config: dict[str, Any],
     api_key: str,
     bucket: TokenBucket | None,
 ) -> tuple[dict[str, Any], str]:
@@ -250,24 +304,32 @@ def infer_one(
             "error",
         )
 
+    prompt_task, generation_config, resolved_max_tokens = resolve_row_generation_config(
+        row,
+        args=args,
+        eval_config=eval_config,
+    )
+
     payload: dict[str, Any] = {
         "model": args.model,
         "messages": messages,
         "temperature": args.temperature,
         "top_p": args.top_p,
     }
-    if args.max_tokens > 0:
-        payload["max_tokens"] = args.max_tokens
+    if resolved_max_tokens > 0:
+        payload["max_tokens"] = resolved_max_tokens
 
     t0 = time.perf_counter()
     base_info = {
         "query_id": query_id,
         "method": method,
+        "prompt_task": prompt_task,
         "model": args.model,
         "request_time_utc": request_ts,
         "temperature": args.temperature,
         "top_p": args.top_p,
-        "max_tokens": args.max_tokens,
+        "max_tokens": resolved_max_tokens,
+        "generation_config": generation_config,
         "prompt_text": row.get("prompt_text", ""),
         "messages": messages,
         "demo_ids": row.get("demo_ids", []),
@@ -360,6 +422,7 @@ def main() -> None:
     if not args.prompts.exists():
         raise FileNotFoundError(f"Prompt file not found: {args.prompts}")
 
+    eval_config = load_eval_config(args.config)
     prompt_rows = read_jsonl(args.prompts)
     if args.query_limit > 0:
         prompt_rows = prompt_rows[: args.query_limit]
@@ -377,7 +440,14 @@ def main() -> None:
         run_name = run_dir.name
 
     selector_meta = load_json(args.selector_meta)
-    selector_params = selector_meta.get("params", {}) if isinstance(selector_meta.get("params", {}), dict) else {}
+    params_obj = selector_meta.get("params")
+    if isinstance(params_obj, dict):
+        selector_params = params_obj
+    elif isinstance(selector_meta, dict):
+        # Compatibility: baseline meta may store fields at top-level.
+        selector_params = selector_meta
+    else:
+        selector_params = {}
     methods_seen = sorted(
         {
             str(r.get("method", "")).strip()
@@ -422,7 +492,7 @@ def main() -> None:
 
     if workers == 1:
         for idx, row in enumerate(rows_to_process, start=1):
-            out_row, status = infer_one(row, args=args, api_key=api_key, bucket=bucket)
+            out_row, status = infer_one(row, args=args, eval_config=eval_config, api_key=api_key, bucket=bucket)
             append_jsonl(out_path, out_row)
             if status == "ok":
                 ok_count += 1
@@ -436,7 +506,7 @@ def main() -> None:
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
-                executor.submit(infer_one, row, args=args, api_key=api_key, bucket=bucket)
+                executor.submit(infer_one, row, args=args, eval_config=eval_config, api_key=api_key, bucket=bucket)
                 for row in rows_to_process
             ]
             processed = 0
@@ -472,6 +542,7 @@ def main() -> None:
         "finished_at_local": finished_at,
         "outputs_file": str(out_path),
         "prompts_file": str(args.prompts),
+        "config_file": str(args.config),
         "selector_meta_file": str(args.selector_meta) if args.selector_meta.exists() else "",
         "model": args.model,
         "base_url": args.base_url,
@@ -480,7 +551,7 @@ def main() -> None:
         "resume": args.resume,
         "temperature": args.temperature,
         "top_p": args.top_p,
-        "max_tokens": args.max_tokens,
+        "max_tokens_override": args.max_tokens,
         "timeout_s": args.timeout_s,
         "retry": args.retry,
         "retry_backoff_s": args.retry_backoff_s,

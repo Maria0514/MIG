@@ -1,8 +1,10 @@
 import argparse
+import io
 import json
 import math
 import multiprocessing as mp
 import re
+import sys
 import time
 import traceback
 from collections import defaultdict
@@ -42,7 +44,6 @@ def strip_code_fence(text: str) -> str:
     probe = src.strip()
     m = re.match(r"^\s*```[^\n`]*\n?(.*?)\n?```\s*$", probe, flags=re.DOTALL)
     if m:
-        # Keep leading indentation in code body; only trim trailing line breaks.
         return m.group(1).rstrip("\r\n")
     if probe.startswith("```"):
         first_newline = probe.find("\n")
@@ -52,56 +53,116 @@ def strip_code_fence(text: str) -> str:
     return src.rstrip("\r\n")
 
 
-def extract_completion(raw_text: str, entry_point: str | None = None) -> str:
+def extract_completion(raw_text: str) -> str:
     src = "" if raw_text is None else str(raw_text)
     if not src.strip():
         return ""
 
-    # Prefer fenced code when present.
     blocks = re.findall(r"```(?:python)?\s*(.*?)```", src, flags=re.DOTALL | re.IGNORECASE)
     if blocks:
         src = max(blocks, key=len).rstrip("\r\n")
     else:
         src = strip_code_fence(src)
 
-    # If model emits long prose, cut from function definition when available.
-    if entry_point:
-        anchor = f"def {entry_point}"
-        pos = src.find(anchor)
-        if pos >= 0:
-            src = src[pos:]
-
     return src.rstrip("\r\n")
 
 
+def normalize_output_text(text: str) -> str:
+    src = "" if text is None else str(text)
+    src = src.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in src.split("\n")]
+    return "\n".join(lines).strip()
+
+
+def expected_output_matches(actual: str, expected: Any) -> bool:
+    actual_norm = normalize_output_text(actual)
+    if isinstance(expected, list):
+        return any(actual_norm == normalize_output_text(item) for item in expected)
+    return actual_norm == normalize_output_text(expected)
+
+
+def _run_code_with_stdin(code: str, input_data: str) -> str:
+    import builtins
+
+    old_stdin = sys.stdin
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    old_argv = sys.argv
+
+    stdin_obj = io.StringIO(input_data)
+    stdout_obj = io.StringIO()
+    stderr_obj = io.StringIO()
+
+    try:
+        sys.stdin = stdin_obj
+        sys.stdout = stdout_obj
+        sys.stderr = stderr_obj
+        sys.argv = ["solution.py"]
+        ns: dict[str, Any] = {"__name__": "__main__"}
+        exec(code, ns)  # noqa: S102
+    except SystemExit:
+        pass
+    finally:
+        sys.stdin = old_stdin
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        sys.argv = old_argv
+
+    return stdout_obj.getvalue()
+
+
 def _eval_worker(
-    query_prompt: str,
     completion: str,
-    test_code: str,
-    entry_point: str,
+    input_output: dict[str, Any],
     queue: mp.Queue,
 ) -> None:
     started_at = time.perf_counter()
-    ns: dict[str, Any] = {}
     try:
-        program = f"{query_prompt}\n{completion}\n"
-        exec(program, ns)  # noqa: S102
-        exec(test_code, ns)  # noqa: S102
+        inputs = input_output.get("inputs", [])
+        outputs = input_output.get("outputs", [])
+        if not isinstance(inputs, list) or not isinstance(outputs, list):
+            raise RuntimeError("tests.input_output.inputs/outputs must both be lists")
+        if len(inputs) != len(outputs):
+            raise RuntimeError("tests.input_output inputs/outputs length mismatch")
 
-        check = ns.get("check")
-        candidate = ns.get(entry_point)
-        if not callable(check):
-            raise RuntimeError("check(...) not found after executing tests")
-        if not callable(candidate):
-            raise RuntimeError(f"entry_point '{entry_point}' is not callable")
+        passed_count = 0
+        case_results: list[dict[str, Any]] = []
+        for idx, (inp, exp) in enumerate(zip(inputs, outputs)):
+            actual = _run_code_with_stdin(completion, str(inp))
+            passed = expected_output_matches(actual, exp)
+            case_results.append(
+                {
+                    "case_index": idx,
+                    "passed": passed,
+                    "input_preview": str(inp)[:200],
+                    "expected_preview": (exp[:200] if isinstance(exp, str) else exp),
+                    "actual_preview": actual[:200],
+                }
+            )
+            if not passed:
+                queue.put(
+                    {
+                        "passed": False,
+                        "error_type": "WrongAnswer",
+                        "error_message": f"Mismatch at case {idx}",
+                        "duration_s": round(time.perf_counter() - started_at, 4),
+                        "passed_case_count": passed_count,
+                        "total_case_count": len(inputs),
+                        "case_results": case_results,
+                    }
+                )
+                return
+            passed_count += 1
 
-        check(candidate)
         queue.put(
             {
                 "passed": True,
                 "error_type": "",
                 "error_message": "",
                 "duration_s": round(time.perf_counter() - started_at, 4),
+                "passed_case_count": passed_count,
+                "total_case_count": len(inputs),
+                "case_results": case_results,
             }
         )
     except Exception as e:  # noqa: BLE001
@@ -111,36 +172,60 @@ def _eval_worker(
                 "error_type": type(e).__name__,
                 "error_message": "".join(traceback.format_exception_only(type(e), e)).strip(),
                 "duration_s": round(time.perf_counter() - started_at, 4),
+                "passed_case_count": 0,
+                "total_case_count": 0,
+                "case_results": [],
             }
         )
 
 
 def eval_in_current_process(
-    query_prompt: str,
     completion: str,
-    test_code: str,
-    entry_point: str,
+    input_output: dict[str, Any],
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
-    ns: dict[str, Any] = {}
     try:
-        program = f"{query_prompt}\n{completion}\n"
-        exec(program, ns)  # noqa: S102
-        exec(test_code, ns)  # noqa: S102
+        inputs = input_output.get("inputs", [])
+        outputs = input_output.get("outputs", [])
+        if not isinstance(inputs, list) or not isinstance(outputs, list):
+            raise RuntimeError("tests.input_output.inputs/outputs must both be lists")
+        if len(inputs) != len(outputs):
+            raise RuntimeError("tests.input_output inputs/outputs length mismatch")
 
-        check = ns.get("check")
-        candidate = ns.get(entry_point)
-        if not callable(check):
-            raise RuntimeError("check(...) not found after executing tests")
-        if not callable(candidate):
-            raise RuntimeError(f"entry_point '{entry_point}' is not callable")
+        passed_count = 0
+        case_results: list[dict[str, Any]] = []
+        for idx, (inp, exp) in enumerate(zip(inputs, outputs)):
+            actual = _run_code_with_stdin(completion, str(inp))
+            passed = expected_output_matches(actual, exp)
+            case_results.append(
+                {
+                    "case_index": idx,
+                    "passed": passed,
+                    "input_preview": str(inp)[:200],
+                    "expected_preview": (exp[:200] if isinstance(exp, str) else exp),
+                    "actual_preview": actual[:200],
+                }
+            )
+            if not passed:
+                return {
+                    "passed": False,
+                    "error_type": "WrongAnswer",
+                    "error_message": f"Mismatch at case {idx}",
+                    "duration_s": round(time.perf_counter() - started_at, 4),
+                    "passed_case_count": passed_count,
+                    "total_case_count": len(inputs),
+                    "case_results": case_results,
+                }
+            passed_count += 1
 
-        check(candidate)
         return {
             "passed": True,
             "error_type": "",
             "error_message": "",
             "duration_s": round(time.perf_counter() - started_at, 4),
+            "passed_case_count": passed_count,
+            "total_case_count": len(inputs),
+            "case_results": case_results,
         }
     except Exception as e:  # noqa: BLE001
         return {
@@ -148,15 +233,16 @@ def eval_in_current_process(
             "error_type": type(e).__name__,
             "error_message": "".join(traceback.format_exception_only(type(e), e)).strip(),
             "duration_s": round(time.perf_counter() - started_at, 4),
+            "passed_case_count": 0,
+            "total_case_count": 0,
+            "case_results": [],
         }
 
 
 def run_single_eval(
     *,
-    query_prompt: str,
     completion: str,
-    test_code: str,
-    entry_point: str,
+    input_output: dict[str, Any],
     timeout_s: float,
 ) -> dict[str, Any]:
     try:
@@ -164,7 +250,7 @@ def run_single_eval(
         queue: mp.Queue = ctx.Queue(maxsize=1)
         proc = ctx.Process(
             target=_eval_worker,
-            args=(query_prompt, completion, test_code, entry_point, queue),
+            args=(completion, input_output, queue),
         )
         t0 = time.perf_counter()
         proc.start()
@@ -178,6 +264,9 @@ def run_single_eval(
                 "error_type": "Timeout",
                 "error_message": f"Execution exceeded {timeout_s}s",
                 "duration_s": round(time.perf_counter() - t0, 4),
+                "passed_case_count": 0,
+                "total_case_count": 0,
+                "case_results": [],
             }
 
         if queue.empty():
@@ -186,12 +275,14 @@ def run_single_eval(
                 "error_type": "NoResult",
                 "error_message": "Worker exited without returning result",
                 "duration_s": round(time.perf_counter() - t0, 4),
+                "passed_case_count": 0,
+                "total_case_count": 0,
+                "case_results": [],
             }
 
         return queue.get()
     except PermissionError:
-        # Fallback for restricted Windows sandbox where multiprocessing pipe creation is denied.
-        return eval_in_current_process(query_prompt, completion, test_code, entry_point)
+        return eval_in_current_process(completion, input_output)
 
 
 def pass_at_k_estimator(n: int, c: int, k: int) -> float | None:
@@ -248,18 +339,18 @@ def build_unique_run_dir(base_dir: Path, run_name: str) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate HumanEval outputs from API inference JSONL and compute pass@k metrics."
+        description="Evaluate APPS outputs from API inference JSONL and compute pass@k metrics."
     )
     parser.add_argument(
         "--inference",
         type=Path,
-        default=Path("data/icl/eval_outputs/v32_mig_k5_full/outputs.jsonl"),
+        required=True,
     )
     parser.add_argument(
         "--prompts",
         type=Path,
-        default=Path("data/icl/eval_prompts/mig_humaneval_k5.jsonl"),
-        help="Fallback source for query_prompt/tests/entry_point by query_id.",
+        required=True,
+        help="Fallback source for tests/query_prompt by query_id.",
     )
     parser.add_argument("--base-out-dir", type=Path, default=Path("data/icl/eval_metrics"))
     parser.add_argument("--run-name", type=str, default="", help="Optional run name. If empty, auto-generated.")
@@ -304,10 +395,10 @@ def main() -> None:
     if isinstance(params_obj, dict):
         selector_params = params_obj
     elif isinstance(selector_meta, dict):
-        # Compatibility: baseline meta may store fields at top-level.
         selector_params = selector_meta
     else:
         selector_params = {}
+
     lambda_quality = selector_params.get("lambda_quality")
     lambda_len = selector_params.get("lambda_len")
     lambda_red = selector_params.get("lambda_red")
@@ -364,15 +455,13 @@ def main() -> None:
             sample_total += 1
             prompt_row = prompt_map.get(qid, {})
 
-            entry_point = str(row.get("entry_point") or prompt_row.get("entry_point") or "").strip()
             tests = row.get("tests")
-            if not isinstance(tests, dict) or "test" not in tests:
+            if not isinstance(tests, dict) or "input_output" not in tests:
                 tests = prompt_row.get("tests", {})
-            test_code = str((tests or {}).get("test", "") or "")
-            query_prompt = str(row.get("query_prompt") or prompt_row.get("query_prompt") or "").rstrip()
+            input_output = (tests or {}).get("input_output", {})
 
             completion_raw = str(row.get("completion_cleaned") or row.get("raw_output") or "")
-            completion = extract_completion(completion_raw, entry_point=entry_point or None)
+            completion = extract_completion(completion_raw)
 
             usage = row.get("usage")
             if isinstance(usage, dict):
@@ -390,24 +479,21 @@ def main() -> None:
             if isinstance(inf_lat, (int, float)):
                 infer_latencies.append(float(inf_lat))
 
-            if not query_prompt or not entry_point or not test_code or not completion:
+            if not isinstance(input_output, dict) or not completion:
                 missing_case_count += 1
                 result = {
-                    "query_id": qid,
-                    "method": query_method,
-                    "sample_rank": rank,
                     "passed": False,
                     "error_type": "MissingField",
-                    "error_message": "query_prompt/entry_point/test/completion missing",
+                    "error_message": "tests.input_output or completion missing",
                     "duration_s": 0.0,
-                    "entry_point": entry_point,
+                    "passed_case_count": 0,
+                    "total_case_count": 0,
+                    "case_results": [],
                 }
             else:
                 result = run_single_eval(
-                    query_prompt=query_prompt,
                     completion=completion,
-                    test_code=test_code,
-                    entry_point=entry_point,
+                    input_output=input_output,
                     timeout_s=args.timeout_s,
                 )
                 query_eval_count += 1
@@ -427,7 +513,8 @@ def main() -> None:
                     "error_type": result.get("error_type", ""),
                     "error_message": result.get("error_message", ""),
                     "eval_duration_s": result.get("duration_s", 0.0),
-                    "entry_point": entry_point,
+                    "passed_case_count": result.get("passed_case_count", 0),
+                    "total_case_count": result.get("total_case_count", 0),
                 }
             )
 
@@ -484,7 +571,13 @@ def main() -> None:
         "avg_total_tokens": mean_or_none(total_tokens),
         "experiment_context": {
             "is_mig_algorithm": bool(args.is_mig_algorithm),
-            "methods_seen": sorted({str(r.get("method", "")).strip() for r in infer_rows if str(r.get("method", "")).strip()}),
+            "methods_seen": sorted(
+                {
+                    str(r.get("method", "")).strip()
+                    for r in infer_rows
+                    if str(r.get("method", "")).strip()
+                }
+            ),
             "difficulty_label_scheme": args.difficulty_label_scheme,
             "penalty_config": {
                 "lambda_quality": lambda_quality,
@@ -519,6 +612,7 @@ def main() -> None:
         {
             "run_name": out_dir.name,
             "created_at_local": datetime.now().isoformat(timespec="seconds"),
+            "eval_dataset": "apps_test",
             "files": {
                 "summary": "summary.json",
                 "per_query": "per_query.jsonl",

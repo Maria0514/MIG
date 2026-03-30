@@ -1,11 +1,14 @@
-# SOP：新对话文档读取与防乱码
+# SOP：新对话读取 docs 与防乱码
 
-适用目录：`D:\study\MIG`  
-目标：新开对话后，快速读取 `docs/` 与关键产物，稳定输出“原型论文 / 迁移思路 / 当前进度”总结，避免乱码。
+适用场景：
+
+- 新开对话后，AI 需要快速建立项目上下文
+- 需要稳定读取 `docs/` 与 PDF
+- 需要避免中文乱码和“盲目复用旧命令”
 
 ---
 
-## 1. 启动与编码设置（必做）
+## 1. 启动与编码设置
 
 在项目根目录执行：
 
@@ -16,52 +19,95 @@ cd D:\study\MIG
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 ```
 
+规则：
+
+1. 所有文本读取显式使用 `-Encoding UTF8`
+2. Python 输出显式 `sys.stdout.reconfigure(encoding="utf-8", errors="ignore")`
+
+---
+
+## 2. 先看哪些文档
+
+推荐阅读顺序：
+
+1. `docs/README.md`
+2. `docs/ICL_OpenHermes_TODO.md`
+3. `docs/评测方案.md`
+4. `docs/设计文档.md`
+5. `docs/MIG_标签图操作指南.md`
+6. `docs/历史实验与设计归档.md`（仅在需要历史追溯时）
+7. `docs/文档同步规范.md`（仅在需要回写 docs 时）
+
 说明：
-1. 所有文本读取默认强制 `UTF-8`。
-2. PowerShell 输出编码先设为 UTF-8，可显著降低中文乱码概率。
+
+- `README.md` 决定“文档职责”和“参数复用规则”
+- `ICL_OpenHermes_TODO.md` 决定“当前状态与下一步”
+- `评测方案.md` 决定“评测协议和命令解释”
+- `设计文档.md` 只负责理论
+- `MIG_标签图操作指南.md` 只负责运行手册
+- `历史实验与设计归档.md` 只在需要解释旧命令、旧结果或设计演化时再读
+- `文档同步规范.md` 只在需要把进展同步回 docs 时再读
 
 ---
 
-## 2. 先看 docs 清单（建立阅读范围）
+## 3. 标准读取命令
 
 ```powershell
-rg --files docs
-Get-ChildItem docs | Select-Object Name,Length,LastWriteTime
-```
-
-阅读优先级建议：
-1. `docs/ICL_OpenHermes_TODO.md`（进度总览）
-2. `docs/ICL_TODO5_query_aware_selector_design.md`（迁移设计）
-3. `docs/设计文档.md`（目标函数改造）
-4. `docs/MIG_标签图操作指南.md`（操作落地）
-5. 两份 PDF（论文与设计文档 PDF 版）
-
----
-
-## 3. 读取 Markdown（防乱码标准命令）
-
-统一使用：
-
-```powershell
-Get-Content -Path docs\ICL_OpenHermes_TODO.md -Encoding UTF8
-Get-Content -Path docs\ICL_TODO5_query_aware_selector_design.md -Encoding UTF8
-Get-Content -Path docs\设计文档.md -Encoding UTF8
-Get-Content -Path docs\MIG_标签图操作指南.md -Encoding UTF8
+Get-Content docs\README.md -Encoding UTF8
+Get-Content docs\ICL_OpenHermes_TODO.md -Encoding UTF8
+Get-Content docs\评测方案.md -Encoding UTF8
+Get-Content docs\设计文档.md -Encoding UTF8
+Get-Content docs\MIG_标签图操作指南.md -Encoding UTF8
+Get-Content docs\历史实验与设计归档.md -Encoding UTF8
 ```
 
 不要省略 `-Encoding UTF8`。
 
 ---
 
-## 4. 读取 PDF（防乱码标准流程）
+## 4. 快速定位关键信息
 
-### 4.1 安装依赖（仅首次或缺失时）
+### 4.1 当前状态
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install pypdf pdfplumber
+rg -n "更新日期|当前快照|已验证结果|下一步 TODO|主要风险" docs/ICL_OpenHermes_TODO.md
 ```
 
-### 4.2 统一抽取脚本（推荐）
+### 4.2 参数复用规则
+
+```powershell
+rg -n "不要直接复用|参数复用规则|必须按任务重新确认|实验超参数" docs/README.md
+```
+
+### 4.3 评测命令与参数
+
+```powershell
+rg -n "Prompt 组装|API 推理|HumanEval 评测|APPS 评测|参数解释" docs/评测方案.md
+```
+
+### 4.4 标签图与选例命令
+
+```powershell
+rg -n "构建标签图|运行 Query-aware 选例|生成 baseline 映射|参数解释" docs/MIG_标签图操作指南.md
+```
+
+### 4.5 理论设计
+
+```powershell
+rg -n "Query 权重设计|统一目标函数|难度建模|当前实现对齐" docs/设计文档.md
+```
+
+### 4.6 历史追溯
+
+```powershell
+rg -n "历史实验记录|TODO5|旧参数|旧口径" docs/历史实验与设计归档.md
+```
+
+---
+
+## 5. 读取 PDF（可选）
+
+### 5.1 抽取两份 PDF
 
 ```powershell
 @'
@@ -86,45 +132,24 @@ print(out)
 '@ | .\.venv\Scripts\python.exe -
 ```
 
-关键规则：
-1. 不要在脚本里硬编码中文 PDF 文件名，使用 `Path("docs").glob("*.pdf")`。
-2. `sys.stdout.reconfigure(encoding="utf-8", errors="ignore")` 可避免控制台编码异常中断。
-3. 抽取后用 `rg` 检索关键段落，比直接控制台全量打印更稳。
-
----
-
-## 5. 快速定位关键信息（建议命令）
-
-### 5.1 论文关键点（方法/结果/结论）
+### 5.2 快速检索论文重点
 
 ```powershell
-rg -n "MIG|Algorithm|Main Results|Table|Conclusion|Limitation|Transferability|Data Scaling" tmp/docs_pdf_extract.txt
-```
-
-### 5.2 项目进度关键点（已完成/未完成）
-
-```powershell
-rg -n "已完成|部分完成|进行中|下一步|更新日期" docs/ICL_OpenHermes_TODO.md
-```
-
-### 5.3 设计风险与实验计划
-
-```powershell
-rg -n "MVP|超参数|评测|消融|风险|里程碑|CLI" docs/ICL_TODO5_query_aware_selector_design.md
+rg -n "MIG|Algorithm|Main Results|Conclusion|Transferability|Data Scaling" tmp/docs_pdf_extract.txt
 ```
 
 ---
 
-## 6. 核验关键产物是否存在（防“文档写了但文件不存在”）
+## 6. 关键产物核验
 
 ```powershell
 $paths = @(
-  'data/icl/metadata/openhermes_data_version.json',
   'configs/valid_tag_path_openhermes_python.json',
-  'data/icl/metadata/openhermes_python_pool_validation.json',
   'outputs/label_graph_openhermes_python_t08.pkl',
+  'data/icl/humaneval_eval_tagged.jsonl',
+  'data/icl/apps_test_eval_tagged.jsonl',
   'data/icl/mappings/humaneval_to_demos.jsonl',
-  'data/icl/metadata/humaneval_to_demos.meta.json'
+  'configs/icl_eval_config.json'
 )
 foreach($p in $paths){
   if(Test-Path $p){
@@ -138,27 +163,36 @@ foreach($p in $paths){
 
 ---
 
-## 7. 输出总结模板（建议固定）
+## 7. 新对话输出模板
 
-每次新对话输出按 4 段：
-1. 原型论文：方法与核心结论（1 段）
-2. 迁移思路：从 MIG 到 query-aware ICL 的改造点（1 段）
-3. 当前进度：已完成 / 部分完成 / 进行中（列表）
-4. 证据核验：关键文件是否存在 + 最近更新时间（列表）
+新开对话后的高效总结建议按 5 段输出：
 
----
-
-## 8. 常见乱码与处理
-
-1. `Get-Content` 中文乱码：补 `-Encoding UTF8`。  
-2. Python 打印报 `UnicodeEncodeError`：加 `sys.stdout.reconfigure(encoding="utf-8", errors="ignore")`。  
-3. 中文路径异常：不要手打中文文件名，改用 `glob` 动态发现。  
-4. PDF 抽取内容断裂：优先写入 `tmp/*.txt` 后再 `rg` 检索，不要直接整页打印到终端。  
+1. 项目目标
+2. 当前快照
+3. 已验证结果
+4. 主要风险 / 待办
+5. 已核验产物
 
 ---
 
-## 9. 本仓库当前已验证可用（截至 2026-03-15）
+## 8. 最重要的约束
 
-1. `docs/*.md` 使用 `Get-Content -Encoding UTF8` 可正常读取。  
-2. `.venv` 安装 `pypdf`/`pdfplumber` 后可抽取两份 PDF。  
-3. `ICL_OpenHermes_TODO.md` 中描述的核心产物路径均已存在。  
+AI 在生成运行命令前，必须先读：
+
+1. `docs/README.md`
+2. 对应脚本所属文档
+
+禁止做法：
+
+- 只看一条旧命令就直接复制运行
+- 不区分 HumanEval 与 APPS 就复用 `--queries / --prompt-task / --max-tokens`
+- 把调试参数 `--query-limit / --pool-limit` 带到正式全量运行
+
+---
+
+## 9. 常见乱码处理
+
+1. `Get-Content` 中文乱码：补 `-Encoding UTF8`
+2. Python 输出编码错误：加 `sys.stdout.reconfigure(encoding="utf-8", errors="ignore")`
+3. 中文路径问题：尽量用 `glob` 自动发现文件，不手打中文文件名
+4. PDF 控制台输出断裂：先写到 `tmp/*.txt` 再检索

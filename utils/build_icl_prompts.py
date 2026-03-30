@@ -1,15 +1,22 @@
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a Python coding assistant. Complete the target function correctly. "
-    "Output only Python code with no markdown fences and no explanation."
+from mig.icl_config import (
+    detect_prompt_task,
+    load_eval_config,
+    method_k_from_config,
+    normalize_method_name,
+    normalize_prompt_task_name,
+    resolve_generation_profile,
+    resolve_prompt_profile,
 )
-DEFAULT_TARGET_INSTRUCTION = "Please provide the completion for the target function only."
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -84,24 +91,33 @@ def strip_code_fence(text: str) -> str:
     m = _FENCE_RE.match(src)
     if m:
         return m.group(1).strip()
+    if src.startswith("```"):
+        first_newline = src.find("\n")
+        if first_newline >= 0:
+            return src[first_newline + 1 :].lstrip("\r\n")
+        return ""
     return src
 
 
 def build_user_prompt(
     demos: list[dict[str, Any]],
     query_prompt: str,
+    *,
+    demo_problem_header: str,
+    demo_solution_header: str,
+    target_problem_header: str,
     target_instruction: str,
 ) -> str:
     blocks: list[str] = []
     for i, demo in enumerate(demos, start=1):
         blocks.append(
             f"[Example {i}]\n"
-            f"Problem:\n{demo['problem']}\n\n"
-            f"Reference Solution:\n{demo['solution']}"
+            f"{demo_problem_header}:\n{demo['problem']}\n\n"
+            f"{demo_solution_header}:\n{demo['solution']}"
         )
 
     blocks.append(
-        f"[Target Problem]\n{query_prompt}\n\n"
+        f"[{target_problem_header}]\n{query_prompt}\n\n"
         f"{target_instruction}"
     )
     return "\n\n".join(blocks)
@@ -114,12 +130,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pool", type=Path, default=Path("data/icl/openhermes_python_related.jsonl"))
     parser.add_argument("--queries", type=Path, default=Path("data/icl/humaneval_eval_tagged.jsonl"))
     parser.add_argument("--mapping", type=Path, default=Path("data/icl/mappings/humaneval_to_demos.jsonl"))
-    parser.add_argument("--out", type=Path, default=Path("data/icl/eval_prompts/mig_humaneval_k8.jsonl"))
+    parser.add_argument("--out", type=Path, default=Path("data/icl/eval_prompts/mig_humaneval_k5.jsonl"))
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/icl_eval_config.json"),
+        help="Optional experiment config. Used to resolve per-method expected k when --k is omitted.",
+    )
 
     parser.add_argument("--query-id-key", type=str, default="id")
     parser.add_argument("--mapping-query-id-key", type=str, default="query_id")
-    parser.add_argument("--k", type=int, default=8, help="Number of demos per query. <=0 means use all mapped demos.")
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=None,
+        help="Expected demos per query. If omitted, read from config by method; if still missing, no k check.",
+    )
     parser.add_argument("--query-limit", type=int, default=0, help="Only export first N mapping rows. 0 means all.")
+    parser.add_argument(
+        "--truncate-to-k",
+        action="store_true",
+        help="Legacy behavior: truncate mapped demos to expected k before building prompts.",
+    )
+    parser.add_argument(
+        "--allow-k-mismatch",
+        action="store_true",
+        help="Do not fail when mapped demo count mismatches expected k.",
+    )
 
     parser.add_argument("--method", type=str, default="mig")
     parser.add_argument(
@@ -135,8 +172,24 @@ def parse_args() -> argparse.Namespace:
         help="Ignore mapping method field and always use --method.",
     )
     parser.set_defaults(method_from_mapping=True)
-    parser.add_argument("--system-prompt", type=str, default=DEFAULT_SYSTEM_PROMPT)
-    parser.add_argument("--target-instruction", type=str, default=DEFAULT_TARGET_INSTRUCTION)
+    parser.add_argument(
+        "--prompt-task",
+        type=str,
+        default="",
+        help="Optional explicit prompt task/profile name. Default: auto-detect from each query row.",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default="",
+        help="Optional override for the resolved system prompt.",
+    )
+    parser.add_argument(
+        "--target-instruction",
+        type=str,
+        default="",
+        help="Optional override for the resolved target instruction.",
+    )
 
     parser.add_argument("--strip-code-fence", dest="strip_code_fence", action="store_true")
     parser.add_argument("--keep-code-fence", dest="strip_code_fence", action="store_false")
@@ -154,6 +207,7 @@ def main() -> None:
         if not p.exists():
             raise FileNotFoundError(f"Not found: {p}")
 
+    eval_config = load_eval_config(args.config)
     pool = read_jsonl(args.pool)
     queries = read_jsonl(args.queries)
     mappings = read_jsonl(args.mapping)
@@ -185,6 +239,12 @@ def main() -> None:
         if not qid:
             continue
 
+        row_method = args.method
+        if args.method_from_mapping:
+            m_method = str(m.get("method", "")).strip()
+            if m_method:
+                row_method = m_method
+
         query = query_map.get(qid)
         if query is None:
             missing_query_count += 1
@@ -215,8 +275,23 @@ def main() -> None:
                     continue
                 mapped_indices.append(idx)
 
-        if args.k > 0:
-            mapped_indices = mapped_indices[: args.k]
+        expected_k = args.k if isinstance(args.k, int) else method_k_from_config(eval_config, row_method)
+        if expected_k is not None and expected_k < 0:
+            raise ValueError("Expected k must be >= 0")
+
+        if args.truncate_to_k and expected_k is not None and expected_k > 0 and len(mapped_indices) > expected_k:
+            mapped_indices = mapped_indices[:expected_k]
+
+        if expected_k is not None and len(mapped_indices) != expected_k:
+            msg = (
+                f"Query {qid} ({normalize_method_name(row_method)}) demo count mismatch: "
+                f"mapped={len(mapped_indices)} expected={expected_k}. "
+                "Regenerate mapping with consistent k, or pass --truncate-to-k for legacy truncation."
+            )
+            if args.allow_k_mismatch:
+                print(f"[WARN] {msg}")
+            else:
+                raise ValueError(msg)
 
         demos: list[dict[str, Any]] = []
         for idx in mapped_indices:
@@ -235,18 +310,23 @@ def main() -> None:
             )
 
         query_prompt = str(query.get("prompt", "") or "")
+        detected_prompt_task = normalize_prompt_task_name(args.prompt_task) if args.prompt_task else detect_prompt_task(query)
+        prompt_task, prompt_profile = resolve_prompt_profile(eval_config, detected_prompt_task)
+        _, generation_profile = resolve_generation_profile(eval_config, prompt_task)
+
+        system_prompt = args.system_prompt or prompt_profile["system_prompt"]
+        target_instruction = args.target_instruction or prompt_profile["target_instruction"]
+
         user_prompt = build_user_prompt(
             demos=demos,
             query_prompt=query_prompt,
-            target_instruction=args.target_instruction,
+            demo_problem_header=prompt_profile["demo_problem_header"],
+            demo_solution_header=prompt_profile["demo_solution_header"],
+            target_problem_header=prompt_profile["target_problem_header"],
+            target_instruction=target_instruction,
         )
-        row_method = args.method
-        if args.method_from_mapping:
-            m_method = str(m.get("method", "")).strip()
-            if m_method:
-                row_method = m_method
         messages = [
-            {"role": "system", "content": args.system_prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
@@ -254,6 +334,9 @@ def main() -> None:
             {
                 "method": row_method,
                 "query_id": qid,
+                "prompt_task": prompt_task,
+                "task_type": query.get("task_type"),
+                "source": query.get("source", {}),
                 "query_labels": query.get("query_labels", []),
                 "entry_point": query.get("entry_point"),
                 "tests": query.get("tests", {}),
@@ -261,10 +344,11 @@ def main() -> None:
                 "demo_ids": [d["demo_id"] for d in demos],
                 "demo_pool_indices": [d["pool_index"] for d in demos],
                 "demos": demos,
-                "system_prompt": args.system_prompt,
+                "generation_config": generation_profile,
+                "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
                 "messages": messages,
-                "prompt_text": f"SYSTEM:\n{args.system_prompt}\n\nUSER:\n{user_prompt}",
+                "prompt_text": f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}",
             }
         )
 

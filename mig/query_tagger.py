@@ -8,13 +8,45 @@ from typing import Any, Iterable, Sequence
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+_JSON_TAG_FIELD_RE = re.compile(r"""["']tag["']\s*:\s*["']([^"']+)["']""", re.IGNORECASE)
+_TEXT_TAG_FIELD_RE = re.compile(r"""^["']?tag["']?\s*:\s*["']?(.*?)["']?$""", re.IGNORECASE)
+_TAG_ALIAS_MAP = {
+    "conditional": "conditional statement",
+    "conditionals": "conditional statement",
+    "conditional statements": "conditional statement",
+    "input output": "input/output",
+    "input and output": "input/output",
+    "i/o": "input/output",
+    "io": "input/output",
+    "problem solving": "problem solve",
+    "problem-solving": "problem solve",
+    "programming logic": "program logic",
+}
+
 
 def _normalize_tag_text(tag: str) -> str:
     """Normalize tag text to match repository tag style."""
     tag = tag.strip().lower()
     tag = tag.replace("_", " ").replace("-", " ")
     tag = re.sub(r"\s+", " ", tag)
-    return tag
+    return _TAG_ALIAS_MAP.get(tag, tag)
+
+
+def _dedupe_preserve_order(tags: Sequence[str]) -> list[str]:
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        if tag in seen:
+            continue
+        uniq.append(tag)
+        seen.add(tag)
+    return uniq
+
+
+def _extract_json_style_tags(raw_text: str) -> list[str]:
+    matches = _JSON_TAG_FIELD_RE.findall(raw_text or "")
+    tags = [_normalize_tag_text(m) for m in matches if _normalize_tag_text(m)]
+    return _dedupe_preserve_order(tags)
 
 
 def _build_valid_tag_index(valid_tags: Sequence[str]) -> dict[str, str]:
@@ -27,10 +59,15 @@ def parse_instag_output(raw_text: str) -> list[str]:
     if not raw_text:
         return []
 
+    json_style_tags = _extract_json_style_tags(raw_text)
+    if json_style_tags:
+        return json_style_tags
+
     text = raw_text.strip()
     # Common wrappers in LLM outputs.
     text = text.replace("Tags:", "").replace("tags:", "")
     text = text.replace("[", "").replace("]", "")
+    text = text.replace("{", "").replace("}", "")
     text = text.replace(";", ",")
     text = text.replace("\n", ",")
 
@@ -39,19 +76,16 @@ def parse_instag_output(raw_text: str) -> list[str]:
         tag = piece.strip().strip('"').strip("'").strip()
         if not tag:
             continue
+        if "explanation" in tag.lower():
+            continue
+        tag_field_match = _TEXT_TAG_FIELD_RE.match(tag)
+        if tag_field_match:
+            tag = tag_field_match.group(1).strip()
         tag = _normalize_tag_text(tag)
         if tag:
             tags.append(tag)
 
-    # Deduplicate while preserving order.
-    uniq: list[str] = []
-    seen: set[str] = set()
-    for tag in tags:
-        if tag in seen:
-            continue
-        uniq.append(tag)
-        seen.add(tag)
-    return uniq
+    return _dedupe_preserve_order(tags)
 
 
 def project_tags_to_valid_set(tags: Sequence[str], valid_tags: Sequence[str]) -> list[str]:

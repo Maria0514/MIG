@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,15 @@ def write_json(path: Path, obj: dict[str, Any]) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
+def format_duration(seconds: float) -> str:
+    total = max(int(seconds), 0)
+    minutes, sec = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
 def read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -39,6 +49,47 @@ def read_json(path: Path) -> dict[str, Any]:
     if isinstance(obj, dict):
         return obj
     return {}
+
+
+def read_jsonl_ids(path: Path) -> list[str]:
+    ids: list[str] = []
+    if not path.exists():
+        return ids
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
+            value = row.get("id")
+            if isinstance(value, (str, int)) and str(value):
+                ids.append(str(value))
+    return ids
+
+
+def load_eval_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
+def method_k_from_config(config: dict[str, Any], method: str) -> int | None:
+    section = config.get("icl_eval")
+    if not isinstance(section, dict):
+        section = config
+    kb = section.get("k_by_method")
+    if not isinstance(kb, dict):
+        return None
+    raw = kb.get(method)
+    if isinstance(raw, int) and raw >= 0:
+        return raw
+    return None
 
 
 def resolve_demo_id(raw: dict[str, Any], pool_index: int) -> str:
@@ -98,6 +149,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queries", type=Path, default=Path("data/icl/humaneval_eval_tagged.jsonl"))
     parser.add_argument("--out", type=Path, default=Path("data/icl/mappings/humaneval_random_k5.jsonl"))
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/icl_eval_config.json"),
+        help="Optional experiment config. Used to resolve per-method k when --k is omitted.",
+    )
+    parser.add_argument(
         "--meta-out",
         type=Path,
         default=None,
@@ -110,7 +167,7 @@ def parse_args() -> argparse.Namespace:
         choices=("zero", "random", "similarity", "sim"),
         required=True,
     )
-    parser.add_argument("--k", type=int, default=5)
+    parser.add_argument("--k", type=int, default=None)
     parser.add_argument("--query-id-key", type=str, default="id")
     parser.add_argument("--query-text-keys", type=str, default="prompt")
     parser.add_argument("--query-limit", type=int, default=0, help="0 means all queries")
@@ -305,13 +362,28 @@ def load_or_build_query_embeddings(
 ) -> np.ndarray:
     np_dtype = np.float16 if dtype == "float16" else np.float32
     meta_path = None if cache_path is None else cache_path.with_suffix(cache_path.suffix + ".meta.json")
+    legacy_meta_path = None if cache_path is None else cache_path.with_suffix(".meta.json")
+    legacy_ids_path = None
+    if cache_path is not None:
+        stem = cache_path.stem
+        if "_emb_" in stem:
+            legacy_ids_name = stem.split("_emb_", 1)[0] + "_ids.jsonl"
+            legacy_ids_path = cache_path.with_name(legacy_ids_name)
 
-    if cache_path is not None and cache_path.exists() and meta_path is not None and meta_path.exists():
+    active_meta_path = None
+    if meta_path is not None and meta_path.exists():
+        active_meta_path = meta_path
+    elif legacy_meta_path is not None and legacy_meta_path.exists():
+        active_meta_path = legacy_meta_path
+
+    if cache_path is not None and cache_path.exists() and active_meta_path is not None:
         emb = np.load(cache_path)
-        meta = read_json(meta_path)
+        meta = read_json(active_meta_path)
         cached_ids = meta.get("query_ids")
+        if not isinstance(cached_ids, list) and legacy_ids_path is not None and legacy_ids_path.exists():
+            cached_ids = read_jsonl_ids(legacy_ids_path)
         if not isinstance(cached_ids, list):
-            raise ValueError(f"Invalid query cache meta: {meta_path}")
+            raise ValueError(f"Invalid query cache meta: {active_meta_path}")
         if emb.ndim != 2 or emb.shape[0] != len(query_ids):
             raise ValueError(
                 f"Invalid query cache shape {emb.shape}; expected ({len(query_ids)}, dim). Remove cache and retry."
@@ -319,7 +391,7 @@ def load_or_build_query_embeddings(
         if [str(x) for x in cached_ids] != query_ids:
             raise ValueError(
                 "Query cache ids mismatch with current query set/order. "
-                f"Cache: {cache_path}, Meta: {meta_path}. Remove cache and retry."
+                f"Cache: {cache_path}, Meta: {active_meta_path}. Remove cache and retry."
             )
         if emb.dtype != np_dtype:
             emb = emb.astype(np_dtype, copy=False)
@@ -395,6 +467,10 @@ def build_similarity_rows(
         dtype=embedding_dtype,
     )
     q_embeddings = q_embeddings.astype(pool_embeddings.dtype, copy=False)
+    total_queries = len(qids)
+    progress_step = 100 if total_queries >= 100 else max(total_queries, 1)
+    started_at = time.perf_counter()
+    print(f"Starting similarity retrieval for {total_queries} queries (k={k_eff}, pool={pool_size})...")
 
     for i, qid in enumerate(qids):
         if k_eff <= 0:
@@ -406,27 +482,42 @@ def build_similarity_rows(
                     "ordered_pool_indices": [],
                 }
             )
-            continue
+        else:
+            scores = pool_embeddings @ q_embeddings[i]
+            cand = np.argpartition(scores, -k_eff)[-k_eff:]
+            order = np.lexsort((cand, -scores[cand]))
+            top_idx = cand[order].tolist()
+            rows.append(
+                {
+                    "method": "sim",
+                    "query_id": qid,
+                    "ordered_demo_ids": [pool_ids[j] for j in top_idx],
+                    "ordered_pool_indices": top_idx,
+                }
+            )
 
-        scores = pool_embeddings @ q_embeddings[i]
-        cand = np.argpartition(scores, -k_eff)[-k_eff:]
-        order = np.lexsort((cand, -scores[cand]))
-        top_idx = cand[order].tolist()
-        rows.append(
-            {
-                "method": "sim",
-                "query_id": qid,
-                "ordered_demo_ids": [pool_ids[j] for j in top_idx],
-                "ordered_pool_indices": top_idx,
-            }
-        )
+        done = i + 1
+        if done == 1 or done % progress_step == 0 or done == total_queries:
+            elapsed = time.perf_counter() - started_at
+            rate = done / elapsed if elapsed > 0 else 0.0
+            eta = (total_queries - done) / rate if rate > 0 else 0.0
+            print(
+                "Similarity retrieval progress: "
+                f"{done}/{total_queries} ({done / total_queries:.1%}) | "
+                f"elapsed {format_duration(elapsed)} | "
+                f"eta {format_duration(eta)}"
+            )
     return rows
 
 
 def main() -> None:
     args = parse_args()
     method = normalize_method_name(args.method)
-    if args.k < 0:
+    eval_config = load_eval_config(args.config)
+    selected_k = args.k if isinstance(args.k, int) else method_k_from_config(eval_config, method)
+    if selected_k is None:
+        selected_k = 0 if method == "zero" else 5
+    if selected_k < 0:
         raise ValueError("--k must be >= 0")
 
     if not args.pool.exists():
@@ -456,7 +547,7 @@ def main() -> None:
             query_id_key=args.query_id_key,
             pool_size=len(pool),
             pool_ids=pool_ids,
-            k=args.k,
+            k=selected_k,
             seed=args.seed,
         )
     elif method == "sim":
@@ -468,7 +559,10 @@ def main() -> None:
             and args.query_emb_cache is not None
             and args.pool_emb_cache.exists()
             and args.query_emb_cache.exists()
-            and args.query_emb_cache.with_suffix(args.query_emb_cache.suffix + ".meta.json").exists()
+            and (
+                args.query_emb_cache.with_suffix(args.query_emb_cache.suffix + ".meta.json").exists()
+                or args.query_emb_cache.with_suffix(".meta.json").exists()
+            )
         )
         if can_try_cache_only:
             try:
@@ -487,7 +581,7 @@ def main() -> None:
                     pool_ids=pool_ids,
                     pool_embeddings=pool_embeddings,
                     model=None,
-                    k=args.k,
+                    k=selected_k,
                     batch_size=args.embedding_batch_size,
                     query_prompt_name=args.similarity_query_prompt_name,
                     query_prompt=args.similarity_query_prompt,
@@ -522,7 +616,7 @@ def main() -> None:
                 pool_ids=pool_ids,
                 pool_embeddings=pool_embeddings,
                 model=model,
-                k=args.k,
+                k=selected_k,
                 batch_size=args.embedding_batch_size,
                 query_prompt_name=args.similarity_query_prompt_name,
                 query_prompt=args.similarity_query_prompt,
@@ -544,7 +638,7 @@ def main() -> None:
             "output_file": str(args.out),
             "query_id_key": args.query_id_key,
             "query_text_keys": query_text_keys,
-            "k": args.k,
+            "k": selected_k,
             "seed": args.seed,
             "pool_size": len(pool),
             "query_size": len(queries),
@@ -567,6 +661,7 @@ def main() -> None:
     )
 
     print(f"Method: {method}")
+    print(f"Selected k: {selected_k}")
     print(f"Pool rows: {len(pool)}")
     print(f"Query rows: {len(queries)}")
     print(f"Output rows: {len(out_rows)}")

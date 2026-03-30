@@ -26,6 +26,35 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def write_json(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def load_eval_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
+def method_k_from_config(config: dict[str, Any], method: str) -> int | None:
+    section = config.get("icl_eval")
+    if not isinstance(section, dict):
+        section = config
+    kb = section.get("k_by_method")
+    if not isinstance(kb, dict):
+        return None
+    raw = kb.get(str(method).strip().lower())
+    if isinstance(raw, int) and raw >= 0:
+        return raw
+    return None
+
+
 def resolve_demo_id(dp: DataPoint, pool_index: int) -> str:
     raw = dp.raw if isinstance(dp.raw, dict) else {}
     for key in ("demo_id", "id", "_id"):
@@ -42,8 +71,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-pkl", type=Path, default=Path("outputs/label_graph_openhermes_python_t08.pkl"))
     parser.add_argument("--valid-tag-path", type=Path, default=Path("configs/valid_tag_path_openhermes_python.json"))
     parser.add_argument("--out", type=Path, default=Path("data/icl/mappings/humaneval_to_demos.jsonl"))
+    parser.add_argument(
+        "--meta-out",
+        type=Path,
+        default=Path("data/icl/metadata/humaneval_to_demos.meta.json"),
+        help="Metadata output path for reproducibility.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/icl_eval_config.json"),
+        help="Optional experiment config. Used to resolve MIG k when --k is omitted.",
+    )
 
-    parser.add_argument("--k", type=int, default=8)
+    parser.add_argument("--k", type=int, default=None)
     parser.add_argument("--tau-q", type=float, default=0.8)
 
     parser.add_argument("--phi-type", choices=("pow", "exp"), default="pow")
@@ -69,6 +110,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    eval_config = load_eval_config(args.config)
+    selected_k = args.k if isinstance(args.k, int) else method_k_from_config(eval_config, "mig")
+    if selected_k is None:
+        selected_k = 5
+    if selected_k < 0:
+        raise ValueError("--k must be >= 0")
 
     if not args.pool.exists():
         raise FileNotFoundError(f"Pool not found: {args.pool}")
@@ -113,7 +160,7 @@ def main() -> None:
 
         indices, steps = selector.select_k_for_query(
             query_labels=q_labels,
-            k=args.k,
+            k=selected_k,
             tau_q=args.tau_q,
             lambda_quality=args.lambda_quality,
             lambda_len=args.lambda_len,
@@ -144,8 +191,45 @@ def main() -> None:
         out_rows.append(row)
 
     write_jsonl(args.out, out_rows)
+    write_json(
+        args.meta_out,
+        {
+            "mapping_file": str(args.out),
+            "pool_file": str(args.pool),
+            "queries_file": str(args.queries),
+            "graph_pkl": str(args.graph_pkl),
+            "valid_tag_path": str(args.valid_tag_path),
+            "params": {
+                "k": selected_k,
+                "tau_q": args.tau_q,
+                "phi_type": args.phi_type,
+                "phi_alpha": args.phi_alpha,
+                "phi_a": args.phi_a,
+                "phi_b": args.phi_b,
+                "lambda_quality": args.lambda_quality,
+                "lambda_len": args.lambda_len,
+                "lambda_red": args.lambda_red,
+                "lambda_diff": args.lambda_diff,
+                "prop_weight": args.prop_weight,
+                "use_difficulty_penalty": bool(args.use_difficulty_penalty),
+                "difficulty_penalty_weight": args.difficulty_penalty_weight,
+                "query_labels_key": args.query_labels_key,
+                "query_id_key": args.query_id_key,
+                "query_limit": args.query_limit,
+                "config": str(args.config),
+            },
+            "stats": {
+                "query_count": len(out_rows),
+                "avg_demo_per_query": (
+                    (sum(len(r.get("ordered_demo_ids", [])) for r in out_rows) / len(out_rows)) if out_rows else 0.0
+                ),
+            },
+        },
+    )
+    print(f"Selected k: {selected_k}")
     print(f"Output rows: {len(out_rows)}")
     print(f"Output: {args.out}")
+    print(f"Meta: {args.meta_out}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,39 @@
+{
+  "icl_eval": {
+    "k_by_method": {
+      "zero": 0,
+      "random": 5,
+      "sim": 5,
+      "mig": 5
+    },
+    "prompt_profiles": {
+      "default": {
+        "system_prompt": "You are a Python coding assistant. Complete the target code correctly. Output only Python code with no markdown fences and no explanation.",
+        "target_instruction": "Write only the Python code needed to solve the target task.",
+        "demo_problem_header": "Problem",
+        "demo_solution_header": "Reference Solution",
+        "target_problem_header": "Target Problem"
+      },
+      "humaneval": {
+        "system_prompt": "You are a Python coding assistant. Complete the target function correctly. Output only Python code with no markdown fences and no explanation.",
+        "target_instruction": "Please provide the completion for the target function only."
+      },
+      "apps_test": {
+        "system_prompt": "You are a Python competitive programming assistant. Solve the target problem as a complete Python 3 program. Read from standard input and write to standard output. If you define solve(), make sure it is called. Output only Python code with no markdown fences and no explanation.",
+        "target_instruction": "Write a complete Python 3 program for the target problem. The program must read from stdin and print the required answer to stdout. Do not return a value from an uncalled helper function. Output only Python code.",
+        "demo_solution_header": "Reference Program"
+      }
+    },
+    "generation_profiles": {
+      "default": {
+        "max_tokens": 2048
+      },
+      "humaneval": {
+        "max_tokens": 1024
+      },
+      "apps_test": {
+        "max_tokens": 3072
+      }
+    }
+  }
+}

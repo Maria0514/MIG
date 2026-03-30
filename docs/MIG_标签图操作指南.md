@@ -1,13 +1,13 @@
-# MIG 标签图操作指南
+# MIG 标签图与选例运行手册
 
-本文档整理了在 `D:\study\MIG` 项目中，围绕标签图（Label Graph）与 ICL 示例选择的完整操作流程：
+本文档只负责三件事：
 
-1. 采样并构建标签图
-2. 导出标签图 `pkl`
-3. 可视化标签图（节点/边）
-4. 导出权重矩阵（WAM）
-5. 运行示例选择（`query_id -> ordered_demo_ids`）
-6. 常见问题排查
+1. 标签图构建与维护
+2. Query-aware ICL 选例
+3. baseline 映射生成
+
+评测链路请看 [评测方案.md](./%E8%AF%84%E6%B5%8B%E6%96%B9%E6%A1%88.md)。  
+项目整体状态请看 [ICL_OpenHermes_TODO.md](./ICL_OpenHermes_TODO.md)。
 
 ---
 
@@ -20,64 +20,106 @@ cd D:\study\MIG
 .\.venv\Scripts\Activate.ps1
 ```
 
-确认以下文件存在：
+当前常用输入：
 
-1. 数据池（按你的任务选择其一）：
-   - 通用示例：`data/annotated.jsonl`
-   - OpenHermes Python 池：`data/icl/openhermes_python_related.jsonl`
-2. 有效标签（按数据池对应）：
-   - 通用示例：`configs/valid_tag_path.json`
-   - OpenHermes Python 池：`configs/valid_tag_path_openhermes_python.json`
-3. 本地 embedding 模型：`models/e5-mistral-7b-instruct`
+- 候选池：`data/icl/openhermes_python_related.jsonl`
+- 有效标签：`configs/valid_tag_path_openhermes_python.json`
+- 标签图：`outputs/label_graph_openhermes_python_t08.pkl`
+- HumanEval Query：`data/icl/humaneval_eval_tagged.jsonl`
+- APPS Query：`data/icl/apps_test_eval_tagged.jsonl`
+- 主配置：`configs/icl_eval_config.json`
 
 ---
 
-## 2. 采样并构建标签图
+## 2. 参数复用原则
 
-### 2.1 首次构图（必须先做一次）
+不要直接复用示例命令里的所有参数。请按下面四类重新检查：
 
-说明：当前代码支持“快速重阈值”，但前提是你先用**新版本代码**重建一次图，把原始相似度矩阵 `_W_raw` 写进 pkl。
+- 路径参数
+  - `--pool`
+  - `--queries`
+  - `--graph-pkl`
+  - `--valid-tag-path`
+  - `--out`
+  - `--meta-out`
 
-如果你当前用的是 OpenHermes Python 池，推荐命令：
+- 实验超参数
+  - `--sim-threshold`
+  - `--tau-q`
+  - `--phi-*`
+  - `--lambda-*`
+  - `--prop-weight`
+
+- 调试参数
+  - `--num`
+  - `--query-limit`
+  - `--pool-limit`
+  - `--with-debug-scores`
+
+- 机器相关参数
+  - `--embedding-device`
+  - `--embedding-batch-size`
+  - `--pool-emb-cache`
+  - `--query-emb-cache`
+
+只有在“明确复现实验”时，才应该原样复用实验超参数。
+
+---
+
+## 3. 构建标签图
+
+### 3.1 OpenHermes Python 池示例
 
 ```powershell
 .\.venv\Scripts\python.exe -m mig.cli sample data/icl/openhermes_python_related.jsonl `
   --out outputs/openhermes_python_sample_1.jsonl `
   --num 1 `
-  --valid-tag-path ./configs/valid_tag_path_openhermes_python.json `
+  --valid-tag-path configs/valid_tag_path_openhermes_python.json `
   --label-graph-type sim `
-  --embedding-model ./models/e5-mistral-7b-instruct `
+  --embedding-model models/e5-mistral-7b-instruct `
   --sim-threshold 0.8 `
   --sampler-type random `
   --dump-label-graph outputs/label_graph_openhermes_python_t08.pkl
 ```
 
-> `--num 1` 只是把“采样写出”成本压到最小，不影响“全量标签图”构建。
+### 3.2 参数解释
 
-### 2.2 通用小样本命令（旧数据示例）
+- `--out`
+  - 采样写出文件。
+  - 仅用于保存 sample 结果，不是标签图文件。
 
-```powershell
-mig sample data/annotated.jsonl `
-  --out outputs/mig_sample_5.jsonl `
-  --num 5 `
-  --valid-tag-path ./configs/valid_tag_path.json `
-  --label-graph-type sim `
-  --embedding-model ./models/e5-mistral-7b-instruct `
-  --sim-threshold 0.6 `
-  --sampler-type mig `
-  --batch-size 4096 `
-  --dump-label-graph outputs/label_graph_t06.pkl
-```
+- `--num`
+  - 写出的 sample 数量。
+  - 常用小值做图构建辅助，不要把它误当成“图只用这么多样本建”。
 
-说明：
+- `--valid-tag-path`
+  - 当前数据池对应的标签空间。
+  - 不能把通用 `valid_tag_path.json` 用到 OpenHermes Python 池。
 
-1. `--sim-threshold` 越高，边越少；越低，边越多。
-2. `--dump-label-graph` 会把标签图保存为 `pkl`。
-3. `--num` 不能超过可用样本数。
+- `--label-graph-type`
+  - 当前主要使用 `sim`。
 
-### 2.3 快速重阈值（不重跑 embedding）
+- `--embedding-model`
+  - 构图时用于标签相似度的 embedding 模型。
+  - 若模型变更，图与阈值语义也会一起变化。
 
-当 pkl 内含 `_W_raw` 后，可以直接重设阈值：
+- `--sim-threshold`
+  - 控制边稀疏度。
+  - 越高边越少，越低边越多。
+  - 不是“越高越好”。
+
+- `--sampler-type`
+  - 此处常用 `random`，因为目标是构图，不是采样比较。
+
+- `--dump-label-graph`
+  - 图的主产物路径。
+  - 后续 `rethreshold/export/select` 都依赖它。
+
+---
+
+## 4. 快速重阈值
+
+当已有图文件中保存了 `_W_raw` 时，可以只改阈值，不重跑 embedding。
 
 ```powershell
 .\.venv\Scripts\python.exe utils/rethreshold_label_graph.py `
@@ -86,35 +128,23 @@ mig sample data/annotated.jsonl `
   --out-pkl outputs/label_graph_openhermes_python_t09.pkl
 ```
 
-这一步只做阈值裁剪，不会再次跑 embedding 模型。
+参数解释：
+
+- `--graph-pkl`
+  - 输入图文件。
+
+- `--sim-threshold`
+  - 新阈值。
+  - 改这个值的同时，输出文件名也应一起改，避免覆盖旧图。
+
+- `--out-pkl`
+  - 新图文件。
+
+如果报 `Raw similarity matrix (_W_raw) is missing`，说明你拿的是旧版 pkl，需要先重新构图。
 
 ---
 
-## 3. 可视化标签图
-
-项目已提供脚本：`utils/visualize_label_graph.py`
-
-```powershell
-.\.venv\Scripts\python.exe utils/visualize_label_graph.py `
-  --graph-pkl outputs/label_graph_t06.pkl
-```
-
-默认后端为 `jaal`。如果缺依赖：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install jaal
-```
-
-注意：
-
-1. 如果提示 `no edges found`，通常是阈值过高，重建图时降低 `--sim-threshold`（例如 `0.6` 或 `0.5`）。
-2. `dash_html_components is deprecated` 是三方库告警，不影响功能。
-
----
-
-## 4. 导出权重矩阵（WAM）
-
-项目已提供脚本：`utils/export_wam_from_pkl.py`
+## 5. 导出 WAM
 
 ```powershell
 .\.venv\Scripts\python.exe utils/export_wam_from_pkl.py `
@@ -124,104 +154,24 @@ mig sample data/annotated.jsonl `
   --labels-out outputs/labels_openhermes_python_t08.txt
 ```
 
-输出说明：
+输出含义：
 
-1. `wam_t06.csv`：带行列标签的矩阵，便于人工查看。
-2. `wam_t06.npy`：`numpy` 格式，便于程序读取。
-3. `labels_t06.txt`：标签列表（每行一个）。
+- `--out-csv`
+  - 便于人工查看
 
----
+- `--out-npy`
+  - 便于程序读取
 
-## 5. 如何理解“节点和边很多”
-
-即使样本只有 10 条，也可能出现较多节点/边，原因是：
-
-1. 节点数 = 去重后的标签数，不等于样本数。
-2. 边是按标签语义相似度阈值连的，不是只看同条样本共现。
-3. 阈值降低后，边会明显增多（这是预期行为）。
+- `--labels-out`
+  - 标签顺序清单
 
 ---
 
-## 6. 常见错误与处理
+## 6. 运行 Query-aware 选例
 
-### 6.1 `No such option: --num-sample`
+脚本：`utils/select_icl_examples.py`
 
-当前代码版本使用：
-
-1. `--num` 或 `-n`
-
-不是 `--num-sample`。
-
-### 6.2 `ValueError: num_sample must be less than or equal to the size of the pool`
-
-请求采样数大于可用样本数。把 `--num` 调小。
-
-### 6.3 `InvalidLineError ... invalid json`
-
-`jsonl` 某行格式坏了。先修复数据文件，再运行采样。
-
-### 6.4 可视化时报错或没有边
-
-1. 优先检查 `pkl` 是否由当前版本代码导出。
-2. 降低 `--sim-threshold` 重建图。
-
-### 6.5 `Raw similarity matrix (_W_raw) is missing`
-
-你正在对旧版 pkl 使用“快速重阈值”。旧版 pkl 只保存了阈值后的 `_W`，没有 `_W_raw`。
-
-处理方法：
-
-1. 用当前代码先跑一次 `mig sample ... --dump-label-graph ...` 重新构图。
-2. 之后再用 `utils/rethreshold_label_graph.py` 快速调阈值。
-
----
-
-## 7. 一条完整演示命令链（OpenHermes）
-
-```powershell
-cd D:\study\MIG
-.\.venv\Scripts\Activate.ps1
-
-.\.venv\Scripts\python.exe -m mig.cli sample data/icl/openhermes_python_related.jsonl `
-  --out outputs/openhermes_python_sample_1.jsonl `
-  --num 1 `
-  --valid-tag-path ./configs/valid_tag_path_openhermes_python.json `
-  --label-graph-type sim `
-  --embedding-model ./models/e5-mistral-7b-instruct `
-  --sim-threshold 0.8 `
-  --sampler-type random `
-  --dump-label-graph outputs/label_graph_openhermes_python_t08.pkl
-
-.\.venv\Scripts\python.exe utils/rethreshold_label_graph.py `
-  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
-  --sim-threshold 0.9 `
-  --out-pkl outputs/label_graph_openhermes_python_t09.pkl
-
-.\.venv\Scripts\python.exe utils/visualize_label_graph.py `
-  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl
-
-.\.venv\Scripts\python.exe utils/export_wam_from_pkl.py `
-  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
-  --out-csv outputs/wam_openhermes_python_t08.csv `
-  --out-npy outputs/wam_openhermes_python_t08.npy `
-  --labels-out outputs/labels_openhermes_python_t08.txt
-```
----
-
-## 8. 运行示例选择（Query -> Demo）
-
-本节用于跑通 query-aware ICL 选例流程，输出 `query_id -> ordered_demo_ids`。
-
-### 8.1 前置输入
-
-需要以下文件：
-
-1. 候选池：`data/icl/openhermes_python_related.jsonl`
-2. query 集（已打标签）：`data/icl/humaneval_eval_tagged.jsonl`
-3. 标签图：`outputs/label_graph_openhermes_python_t08.pkl`
-4. 有效标签表：`configs/valid_tag_path_openhermes_python.json`
-
-### 8.2 小规模联调（建议先跑）
+### 6.1 小规模联调
 
 ```powershell
 .\.venv\Scripts\python.exe utils/select_icl_examples.py `
@@ -229,8 +179,9 @@ cd D:\study\MIG
   --queries data/icl/humaneval_eval_tagged.jsonl `
   --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
   --valid-tag-path configs/valid_tag_path_openhermes_python.json `
-  --out data/icl/mappings/humaneval_to_demos_demo3.jsonl `
-  --k 8 `
+  --out data/icl/mappings/humaneval_to_demos_debug.jsonl `
+  --meta-out data/icl/metadata/humaneval_to_demos_debug.meta.json `
+  --config configs/icl_eval_config.json `
   --tau-q 0.8 `
   --phi-type pow `
   --phi-a 1e-6 `
@@ -244,12 +195,7 @@ cd D:\study\MIG
   --with-debug-scores
 ```
 
-说明：
-
-1. `--query-limit 3` 只跑前 3 条 query，用于快速检查流程。
-2. `--with-debug-scores` 会在输出里附带每一步打分拆解。
-
-### 8.3 全量运行（164 条 HumanEval）
+### 6.2 全量 HumanEval
 
 ```powershell
 .\.venv\Scripts\python.exe utils/select_icl_examples.py `
@@ -258,7 +204,8 @@ cd D:\study\MIG
   --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
   --valid-tag-path configs/valid_tag_path_openhermes_python.json `
   --out data/icl/mappings/humaneval_to_demos.jsonl `
-  --k 8 `
+  --meta-out data/icl/metadata/humaneval_to_demos.meta.json `
+  --config configs/icl_eval_config.json `
   --tau-q 0.8 `
   --phi-type pow `
   --phi-a 1e-6 `
@@ -270,120 +217,211 @@ cd D:\study\MIG
   --prop-weight 1.0
 ```
 
-### 8.4 结果与参数记录
+### 6.3 参数解释
 
-全量运行后建议检查并保存：
+- `--pool`
+  - 候选示例池。
 
-1. 映射结果：`data/icl/mappings/humaneval_to_demos.jsonl`
-2. 元数据记录：`data/icl/metadata/humaneval_to_demos.meta.json`
+- `--queries`
+  - Query 文件。
+  - HumanEval 与 APPS 不能混用。
 
-元数据中包含：输入路径、超参数、运行名、输出统计（例如 query 覆盖率、每条 K 值、是否有重复 demo）。
+- `--graph-pkl`
+  - 当前使用的标签图。
+
+- `--valid-tag-path`
+  - 必须与 `--pool` 对应。
+
+- `--out`
+  - 映射输出文件。
+  - 建议显式写出任务、方法和调试/正式区别。
+
+- `--meta-out`
+  - 元数据文件。
+  - 评测和复现时建议总是保留。
+
+- `--config`
+  - 如果没传 `--k`，脚本会尝试从 `k_by_method.mig` 读取。
+
+- `--k`
+  - 当前 query 选几条 demo。
+  - 不传时默认读配置；配置里没有才退到 `5`。
+
+- `--tau-q`
+  - Query 标签邻域阈值。
+  - 是实验超参数，不是固定默认值。
+
+- `--phi-type`
+  - 当前支持 `pow` / `exp`。
+
+- `--phi-a`
+  - `pow/exp` 族的平滑项或下界保护参数。
+
+- `--phi-b`
+  - `pow` 型凹函数的曲率参数。
+  - 越小越强调边际递减。
+
+- `--phi-alpha`
+  - 只有在明确使用时才调；大多数现有实验更常调 `phi-a/phi-b`。
+
+- `--lambda-quality`
+  - 质量项权重。
+
+- `--lambda-len`
+  - 长度惩罚强度。
+  - `0` 表示关闭长度惩罚。
+
+- `--lambda-red`
+  - 冗余惩罚强度。
+
+- `--lambda-diff`
+  - 难度分布项接口。
+  - 当前仍属于未完成实验项，不应无脑沿用旧值。
+
+- `--prop-weight`
+  - 标签图传播强度。
+
+- `--query-limit`
+  - 调试时常用小值；正式全量运行前要确认恢复为 `0`。
+
+- `--with-debug-scores`
+  - 输出每一步打分拆解。
+  - 有助于排障，但会让输出更大。
 
 ---
 
-## 9. 评测闭环（Prompt 组装 -> API 推理 -> HumanEval 评测）
+## 7. 生成 baseline 映射
 
-本节用于跑通完整评测链路，并将每次运行产物归档到独立目录。
+脚本：`utils/build_baseline_mappings.py`
 
-### 9.1 组装 `k=5` 的评测 Prompt
-
-```powershell
-.\.venv\Scripts\python.exe utils/build_icl_prompts.py `
-  --k 5 `
-  --out data/icl/eval_prompts/mig_humaneval_k5.jsonl
-```
-
-### 9.2 调用 SiliconFlow API（DeepSeek-V3.2）
-
-脚本默认读取 `.env` 中的 `SILICONFLOW_API_KEY`，并使用：
-- `base_url = https://api.siliconflow.cn/v1`
-- `model = deepseek-ai/DeepSeek-V3.2`
-
-```powershell
-.\.venv\Scripts\python.exe utils/run_api_infer.py `
-  --prompts data/icl/eval_prompts/mig_humaneval_k5.jsonl `
-  --run-name v32_mig_k5_full `
-  --parallelism 4 `
-  --rate-limit-qps 1.0 `
-  --bucket-capacity 2.0
-```
-
-输出目录：
-- `data/icl/eval_outputs/v32_mig_k5_full/outputs.jsonl`
-- `data/icl/eval_outputs/v32_mig_k5_full/run_manifest.json`
-
-### 9.3 执行 HumanEval 自动评测
-
-```powershell
-.\.venv\Scripts\python.exe utils/eval_humaneval.py `
-  --inference data/icl/eval_outputs/v32_mig_k5_full/outputs.jsonl `
-  --prompts data/icl/eval_prompts/mig_humaneval_k5.jsonl `
-  --k-list 1,5 `
-  --run-name v32_mig_k5_full_eval
-```
-
-输出目录：
-- `data/icl/eval_metrics/v32_mig_k5_full_eval/summary.json`
-- `data/icl/eval_metrics/v32_mig_k5_full_eval/per_query.jsonl`
-- `data/icl/eval_metrics/v32_mig_k5_full_eval/per_sample.jsonl`
-- `data/icl/eval_metrics/v32_mig_k5_full_eval/run_manifest.json`
-
-### 9.4 本次会话结果（2026-03-15）
-
-1. 全量 164 条推理成功（`written_ok=164, written_error=0`）。
-2. `pass@1 = 0.8537`（`140/164`）。
-3. 当前每题 1 个 completion；`pass@5` 需多采样后再统计。
-
----
-
-## 10. Baseline 对照组（Zero / Random / Similarity）
-
-### 10.1 生成 baseline 映射
+### 7.1 Zero / Random / Similarity 示例
 
 ```powershell
 .\.venv\Scripts\python.exe utils/build_baseline_mappings.py `
   --method zero `
-  --k 0 `
+  --config configs/icl_eval_config.json `
+  --queries data/icl/humaneval_eval_tagged.jsonl `
   --out data/icl/mappings/humaneval_zero_k0.jsonl
 
 .\.venv\Scripts\python.exe utils/build_baseline_mappings.py `
   --method random `
-  --k 5 `
+  --config configs/icl_eval_config.json `
+  --queries data/icl/humaneval_eval_tagged.jsonl `
   --seed 42 `
   --out data/icl/mappings/humaneval_random_k5.jsonl
 
 .\.venv\Scripts\python.exe utils/build_baseline_mappings.py `
   --method sim `
-  --k 5 `
+  --config configs/icl_eval_config.json `
+  --queries data/icl/humaneval_eval_tagged.jsonl `
   --embedding-model models/e5-mistral-7b-instruct `
   --embedding-device cpu `
-  --embedding-batch-size 1 `
-  --pool-emb-cache data/icl/cache/openhermes_e5m7b_pool_emb_f16.npy `
+  --embedding-batch-size 64 `
+  --pool-text-max-chars 1200 `
+  --query-text-max-chars 1200 `
+  --pool-emb-cache cache/openhermes_e5m7b_pool_emb_f16.npy `
+  --query-emb-cache cache/humaneval_e5m7b_query_emb_f16.npy `
   --embedding-dtype float16 `
   --out data/icl/mappings/humaneval_sim_k5.jsonl
 ```
 
-### 10.2 评测两条常用路径
+### 7.2 参数解释
 
-1. 分步执行：`build_icl_prompts.py -> run_api_infer.py -> eval_humaneval.py`
-2. 一键执行：`utils/run_baseline_pipeline.py`
+- `--method`
+  - `zero` / `random` / `sim`
+  - `similarity` 会归一化为 `sim`
+
+- `--k`
+  - 不传时优先从配置 `k_by_method` 读取。
+
+- `--seed`
+  - 只影响 `random`。
+
+- `--query-limit`
+  - 调试时才用小值。
+
+- `--pool-limit`
+  - 调试相似度检索时可用，正式运行通常保持 `0`。
+
+- `--pool-text-max-chars`
+  - 相似度检索时，用于截断 pool 文本长度。
+  - 太小会丢信息，太大会拖慢编码。
+
+- `--query-text-max-chars`
+  - 相似度检索时，用于截断 query 文本长度。
+
+- `--embedding-device`
+  - 当前机器是 `cpu` 还是 `cuda`。
+  - 不要假设所有机器都有 GPU。
+
+- `--embedding-batch-size`
+  - 受显存/内存限制。
+
+- `--pool-emb-cache`
+  - 候选池 embedding 缓存。
+  - 建议放在项目根目录 `cache/`，不要混到数据目录。
+
+- `--query-emb-cache`
+  - Query embedding 缓存。
+  - 需要与当前 query 文件一一对应。
+
+- `--embedding-dtype`
+  - `float16` 更省空间，`float32` 更稳妥。
+
+---
+
+## 8. 一键 baseline pipeline
+
+脚本：`utils/run_baseline_pipeline.py`
 
 ```powershell
 .\.venv\Scripts\python.exe utils/run_baseline_pipeline.py `
   --methods zero,random,sim `
-  --k 5 `
-  --run-prefix v32_baseline `
+  --config configs/icl_eval_config.json `
+  --queries data/icl/humaneval_eval_tagged.jsonl `
+  --run-prefix 20260329-baseline `
   --embedding-device cpu `
-  --embedding-batch-size 1 `
-  --pool-emb-cache data/icl/cache/openhermes_e5m7b_pool_emb_f16.npy
+  --pool-emb-cache cache/openhermes_e5m7b_pool_emb_f16.npy
 ```
 
-### 10.3 相似度基线常见卡住现象
+注意：
 
-症状：`Batches` 长时间显示 `0%`，CPU 低、内存高。  
-解释：CPU 下运行 7B embedding 模型，常见内存压力与换页导致吞吐极低。  
+- `--k` 可能被配置 `k_by_method` 覆盖。
+- `--run-prefix` 应该每次更换，避免目录混淆。
+- `--query-limit` / `--pool-limit` 仍然是高风险调试参数。
+- 评测参数如 `--eval-k-list`、`--eval-timeout-s` 也需要按当前任务确认。
+
+---
+
+## 9. 常见问题
+
+### 9.1 `No such option: --num-sample`
+
+当前命令使用的是：
+
+- `--num`
+
+不是 `--num-sample`。
+
+### 9.2 `ValueError: num_sample must be less than or equal to the size of the pool`
+
+说明 `--num` 超过可用样本数。
+
+### 9.3 `Raw similarity matrix (_W_raw) is missing`
+
+说明你在对旧版 pkl 做快速重阈值，需要先重新构图。
+
+### 9.4 相似度检索很慢
+
+常见原因：
+
+- 设备是 CPU
+- batch 过大
+- 没有启用 cache
+- query/pool 文本太长
+
 建议：
 
-1. 优先在 VM/GPU 环境跑 `Similarity-ICL`。
-2. 保留 `--pool-emb-cache`，让候选池 embedding 一次编码、多次复用。
-3. 先小规模验证（`query-limit` / `pool-limit`），再全量运行。
+1. 优先启用 `--pool-emb-cache` 和 `--query-emb-cache`
+2. 先小规模验证
+3. 如有 GPU，优先改 `--embedding-device cuda`

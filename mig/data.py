@@ -23,15 +23,36 @@ class DataPoint(BaseModel):
 
 class MIGDataPoint(DataPoint):
     valid_tags: ClassVar[List[str]] = None
+    valid_tag_path_loaded: ClassVar[str] = ""
         
     @classmethod
     def init(
         cls,
         valid_tag_path: str = '',
     ):
-        if cls.valid_tags is None:
+        resolved = str(Path(valid_tag_path).resolve()) if valid_tag_path else ""
+        if cls.valid_tags is None or cls.valid_tag_path_loaded != resolved:
             with open(valid_tag_path, 'r') as f:
                 cls.valid_tags = json.load(f)
+            cls.valid_tag_path_loaded = resolved
+
+    @staticmethod
+    def _extract_labels(d: dict) -> list[str]:
+        raw_labels = d.get("query_labels")
+        if isinstance(raw_labels, list):
+            return [str(t) for t in raw_labels if isinstance(t, str) and str(t).strip()]
+
+        raw_tags = d.get("query_tags_raw")
+        if isinstance(raw_tags, list):
+            return [str(t) for t in raw_tags if isinstance(t, str) and str(t).strip()]
+
+        ann = d.get("annotation") or {}
+        instag = ann.get("instag") or {}
+        content = instag.get("content")
+        if isinstance(content, list):
+            return [str(t) for t in content if isinstance(t, str) and str(t).strip()]
+
+        return []
     
     @classmethod
     def from_dict(cls, d: dict):
@@ -49,9 +70,9 @@ class MIGDataPoint(DataPoint):
             score += d["annotation"]["deita"]["quality_scores"][i] * d["annotation"]["deita"]["complexity_scores"][i]
         score = score / len(d["annotation"]["deita"]["quality_scores"])
         
-        # labels
-        labels = [t for t in d["annotation"]["instag"]["content"] if t in cls.valid_tags]
-        
+        # labels: prefer latest lightweight/open-set query_labels, then fall back to legacy tags.
+        labels = [t for t in cls._extract_labels(d) if t in cls.valid_tags]
+
         return cls(labels=labels, score=score, raw=d)
         
 

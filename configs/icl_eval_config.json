@@ -29,10 +29,10 @@
         "max_tokens": 2048
       },
       "humaneval": {
-        "max_tokens": 1024
+        "max_tokens": 2048
       },
       "apps_test": {
-        "max_tokens": 3072
+        "max_tokens": 2048
       }
     }
   }

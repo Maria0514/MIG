@@ -384,19 +384,44 @@ def load_or_build_query_embeddings(
             cached_ids = read_jsonl_ids(legacy_ids_path)
         if not isinstance(cached_ids, list):
             raise ValueError(f"Invalid query cache meta: {active_meta_path}")
-        if emb.ndim != 2 or emb.shape[0] != len(query_ids):
+        cached_ids = [str(x) for x in cached_ids]
+        if emb.ndim != 2 or emb.shape[0] != len(cached_ids):
             raise ValueError(
-                f"Invalid query cache shape {emb.shape}; expected ({len(query_ids)}, dim). Remove cache and retry."
+                f"Invalid query cache shape {emb.shape}; expected ({len(cached_ids)}, dim) from cache meta. Remove cache and retry."
             )
-        if [str(x) for x in cached_ids] != query_ids:
-            raise ValueError(
-                "Query cache ids mismatch with current query set/order. "
-                f"Cache: {cache_path}, Meta: {active_meta_path}. Remove cache and retry."
+
+        if cached_ids == query_ids:
+            if emb.dtype != np_dtype:
+                emb = emb.astype(np_dtype, copy=False)
+            print(f"Loaded query embeddings from cache: {cache_path}")
+            return emb
+
+        # Fast path for filtered query sets: allow current queries to be an ordered subset
+        # of a larger cached query set, and slice the cached matrix instead of rebuilding.
+        index_by_id = {qid: i for i, qid in enumerate(cached_ids)}
+        subset_indices: list[int] = []
+        missing_ids: list[str] = []
+        for qid in query_ids:
+            idx = index_by_id.get(qid)
+            if idx is None:
+                missing_ids.append(qid)
+            else:
+                subset_indices.append(idx)
+
+        if not missing_ids:
+            sliced = emb[subset_indices]
+            if sliced.dtype != np_dtype:
+                sliced = sliced.astype(np_dtype, copy=False)
+            print(
+                "Loaded query embeddings by subsetting cache: "
+                f"{cache_path} ({len(query_ids)}/{len(cached_ids)} rows kept)"
             )
-        if emb.dtype != np_dtype:
-            emb = emb.astype(np_dtype, copy=False)
-        print(f"Loaded query embeddings from cache: {cache_path}")
-        return emb
+            return sliced
+
+        raise ValueError(
+            "Query cache ids mismatch with current query set/order, and current queries are not a subset of the cache. "
+            f"Cache: {cache_path}, Meta: {active_meta_path}. Missing ids: {missing_ids[:5]}"
+        )
 
     if model is None:
         raise ValueError("Query embedding cache unavailable; model is required to build query embeddings.")

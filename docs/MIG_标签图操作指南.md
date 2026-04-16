@@ -26,8 +26,18 @@ cd D:\study\MIG
 - 有效标签：`configs/valid_tag_path_openhermes_python.json`
 - 标签图：`outputs/label_graph_openhermes_python_t08.pkl`
 - HumanEval Query：`data/icl/humaneval_eval_tagged.jsonl`
+- HumanEval 严格投影对比集：`data/icl/humaneval_eval_tagged_projected.jsonl`
 - APPS Query：`data/icl/apps_test_eval_tagged.jsonl`
 - 主配置：`configs/icl_eval_config.json`
+
+当前稳定口径（`2026-04-12`）：
+
+- Pool 侧已切换为优先读取最新 `query_labels`，仅在缺失时回退到 `query_tags_raw / annotation.instag.content`。
+- `configs/valid_tag_path_openhermes_python.json` 当前是基于 `data/icl/openhermes_python_related.jsonl` 中的 `query_labels` 重建的，不再沿用旧 `instag` 标签空间。
+- 本地稳定构建口径是 `min_freq=30`；当前 `valid_tag_path` 共 `1556` 个标签。
+- 当前 `outputs/label_graph_openhermes_python_t08.pkl`、`outputs/wam_openhermes_python_t08.npy`、`outputs/wam_openhermes_python_t08.csv`、`outputs/labels_openhermes_python_t08.txt` 已与这套 `1556` 标签空间对齐。
+- 由于本地机器无 GPU，`e5-mistral-7b-instruct` 无法在可接受时间内直接对 `63057` 个 open-set 标签全量构图，因此当前稳定流程是先做频次过滤再构图。
+- 截至 `2026-04-15`，`data/icl/humaneval_eval_tagged_projected.jsonl` 已按“严格投影后删除 `query_labels_graph=[]` 样本”的口径过滤为 `148` 条；若目标是做 HumanEval 四方法纯对比，应优先使用这份文件，而不是原始 `164` 条 open-set 版。
 
 ---
 
@@ -68,11 +78,27 @@ cd D:\study\MIG
 
 ## 3. 构建标签图
 
-### 3.1 OpenHermes Python 池示例
+### 3.1 先重建 `valid_tag_path`
+
+```powershell
+.\.venv\Scripts\python.exe utils/build_valid_tag_path.py `
+  --input data/icl/openhermes_python_related.jsonl `
+  --out configs/valid_tag_path_openhermes_python.json `
+  --labels-key query_labels `
+  --min-freq 30
+```
+
+说明：
+
+- 当前稳定流程必须先重建 `valid_tag_path`，再继续构图；不要把旧版 `valid_tag_path` 直接复用到新的 `query_labels` 数据上。
+- 当前这份 OpenHermes Python 池中，`query_labels` 全量唯一标签约为 `63057`；本地稳定口径先做 `min_freq=30` 过滤，再得到当前 `1556` 标签版本。
+- 如果后续切到更强算力机器并决定调整 `min_freq`，应把 `valid_tag_path / label_graph / wam / labels` 整套产物一起重建，而不是只换其中一个文件。
+
+### 3.2 OpenHermes Python 池构图示例
 
 ```powershell
 .\.venv\Scripts\python.exe -m mig.cli sample data/icl/openhermes_python_related.jsonl `
-  --out outputs/openhermes_python_sample_1.jsonl `
+  --out outputs/openhermes_python_sample_1_latest.jsonl `
   --num 1 `
   --valid-tag-path configs/valid_tag_path_openhermes_python.json `
   --label-graph-type sim `
@@ -82,7 +108,13 @@ cd D:\study\MIG
   --dump-label-graph outputs/label_graph_openhermes_python_t08.pkl
 ```
 
-### 3.2 参数解释
+当前这轮稳定产物对应的是：
+
+- `sim_threshold=0.8`
+- `valid_tag_path` 来自最新 `query_labels`
+- 标签总数 `1556`
+
+### 3.3 参数解释
 
 - `--out`
   - 采样写出文件。
@@ -94,7 +126,8 @@ cd D:\study\MIG
 
 - `--valid-tag-path`
   - 当前数据池对应的标签空间。
-  - 不能把通用 `valid_tag_path.json` 用到 OpenHermes Python 池。
+  - 当前 OpenHermes Python 池应使用“基于最新 `query_labels` + `min_freq=30`”重建出的版本。
+  - 不能把通用 `valid_tag_path.json` 或旧 `instag` 版本直接用到现在这套池子上。
 
 - `--label-graph-type`
   - 当前主要使用 `sim`。
@@ -165,11 +198,20 @@ cd D:\study\MIG
 - `--labels-out`
   - 标签顺序清单
 
+当前稳定导出的 `wam / labels` 与 `outputs/label_graph_openhermes_python_t08.pkl` 一一对应，标签数应为 `1556`。
+
 ---
 
 ## 6. 运行 Query-aware 选例
 
 脚本：`utils/select_icl_examples.py`
+
+注意：
+
+- 当前 pool 侧会优先消费 `query_labels`，因此 `--valid-tag-path` 与 `--graph-pkl` 也必须对应这套最新标签空间。
+- 如果出现“query 标签大量不命中图标签”的现象，先检查是不是把新 query 文件和旧图产物混用了。
+- 如果当前目标是做 HumanEval 四方法纯对比，`MIG` 应使用 `data/icl/humaneval_eval_tagged_projected.jsonl`，并显式指定 `--query-labels-key query_labels_graph`。
+- 当前 `data/icl/humaneval_eval_tagged_projected.jsonl` 已删除 `16` 条 `query_labels_graph=[]` 的样本；不要再把原始 `164` 条 open-set HumanEval 和这份 `148` 条 projected 对比集混在同一轮主结果里。
 
 ### 6.1 小规模联调
 
@@ -187,7 +229,7 @@ cd D:\study\MIG
   --phi-a 1e-6 `
   --phi-b 0.6 `
   --lambda-quality 0.1 `
-  --lambda-len 0.05 `
+  --lambda-len 0.3 `
   --lambda-red 0.1 `
   --lambda-diff 0.0 `
   --prop-weight 1.0 `
@@ -211,13 +253,37 @@ cd D:\study\MIG
   --phi-a 1e-6 `
   --phi-b 0.6 `
   --lambda-quality 0.1 `
-  --lambda-len 0.05 `
+  --lambda-len 0.3 `
   --lambda-red 0.1 `
   --lambda-diff 0.0 `
   --prop-weight 1.0
 ```
 
-### 6.3 参数解释
+### 6.3 全量 HumanEval（projected 148 条正式对比集）
+
+```powershell
+.\.venv\Scripts\python.exe utils/select_icl_examples.py `
+  --pool data/icl/openhermes_python_related.jsonl `
+  --queries data/icl/humaneval_eval_tagged_projected.jsonl `
+  --graph-pkl outputs/label_graph_openhermes_python_t08.pkl `
+  --valid-tag-path configs/valid_tag_path_openhermes_python.json `
+  --query-labels-key query_labels_graph `
+  --out data/icl/mappings/20260415_humaneval_projected148_mig_lenp050_k5.jsonl `
+  --meta-out data/icl/metadata/20260415_humaneval_projected148_mig_lenp050_k5.meta.json `
+  --config configs/icl_eval_config.json `
+  --k 5 `
+  --tau-q 0.8 `
+  --phi-type pow `
+  --phi-a 1e-6 `
+  --phi-b 0.6 `
+  --lambda-quality 0.1 `
+  --lambda-len 0.5 `
+  --lambda-red 0.1 `
+  --lambda-diff 0.0 `
+  --prop-weight 1.0
+```
+
+### 6.4 参数解释
 
 - `--pool`
   - 候选示例池。
@@ -225,12 +291,18 @@ cd D:\study\MIG
 - `--queries`
   - Query 文件。
   - HumanEval 与 APPS 不能混用。
+  - 若是当前 HumanEval 四方法主对比，优先使用 `data/icl/humaneval_eval_tagged_projected.jsonl` 这份 `148` 条过滤后文件。
 
 - `--graph-pkl`
   - 当前使用的标签图。
 
 - `--valid-tag-path`
   - 必须与 `--pool` 对应。
+
+- `--query-labels-key`
+  - 只在 query 文件里同时存在多套标签字段时需要显式传入。
+  - 当前 HumanEval projected 对比集运行 `MIG` 时，应传 `query_labels_graph`。
+  - `zero/random/sim` 不依赖这个字段。
 
 - `--out`
   - 映射输出文件。
@@ -269,6 +341,7 @@ cd D:\study\MIG
 
 - `--lambda-len`
   - 长度惩罚强度。
+  - 当前稳定默认值是 `0.3`。
   - `0` 表示关闭长度惩罚。
 
 - `--lambda-red`
@@ -300,20 +373,20 @@ cd D:\study\MIG
 .\.venv\Scripts\python.exe utils/build_baseline_mappings.py `
   --method zero `
   --config configs/icl_eval_config.json `
-  --queries data/icl/humaneval_eval_tagged.jsonl `
+  --queries data/icl/humaneval_eval_tagged_projected.jsonl `
   --out data/icl/mappings/humaneval_zero_k0.jsonl
 
 .\.venv\Scripts\python.exe utils/build_baseline_mappings.py `
   --method random `
   --config configs/icl_eval_config.json `
-  --queries data/icl/humaneval_eval_tagged.jsonl `
+  --queries data/icl/humaneval_eval_tagged_projected.jsonl `
   --seed 42 `
   --out data/icl/mappings/humaneval_random_k5.jsonl
 
 .\.venv\Scripts\python.exe utils/build_baseline_mappings.py `
   --method sim `
   --config configs/icl_eval_config.json `
-  --queries data/icl/humaneval_eval_tagged.jsonl `
+  --queries data/icl/humaneval_eval_tagged_projected.jsonl `
   --embedding-model models/e5-mistral-7b-instruct `
   --embedding-device cpu `
   --embedding-batch-size 64 `
@@ -359,11 +432,25 @@ cd D:\study\MIG
 
 - `--pool-emb-cache`
   - 候选池 embedding 缓存。
-  - 建议放在项目根目录 `cache/`，不要混到数据目录。
+  - 默认放在项目根目录 `cache/`，不要混到数据目录。
+  - `sim` 正式运行时默认应显式传入，并且必须与当前候选池文件一一对应；不要混用其他候选池的 cache。
 
 - `--query-emb-cache`
   - Query embedding 缓存。
+  - 默认放在项目根目录 `cache/`。
   - 需要与当前 query 文件一一对应。
+  - `sim` 正式运行时默认应显式传入，并且必须与当前评测集一一对应；例如 HumanEval 与 APPS 必须使用不同 cache。
+  - 对当前 `data/icl/humaneval_eval_tagged_projected.jsonl` 而言，可以继续复用 `cache/humaneval_e5m7b_query_emb_f16.npy`，因为 projected 文件只变更标签字段，不改变 HumanEval 文本与顺序。
+  - 截至 `2026-04-16`，更推荐直接使用专用子集 cache：`cache/humaneval_projected148_e5m7b_query_emb_f16.npy`。
+  - 当前 `utils/build_baseline_mappings.py` 也已支持“当前 query 集是旧 cache 的有序子集”时自动裁切旧 cache，因此即使继续传 `cache/humaneval_e5m7b_query_emb_f16.npy`，也不会再因为 `164 -> 148` 的 shape mismatch 而强制回退到加载 embedding 模型。
+
+对 `sim` 的固定口径补充：
+
+- 只要是正式运行 `Similarity-ICL`，默认同时提供：
+  - 与当前候选池对应的 `--pool-emb-cache`
+  - 与当前评测集对应的 `--query-emb-cache`
+- 这两类 cache 默认都落在项目根目录 `cache/`。
+- 不要省略 `query` cache，也不要把 HumanEval 的 query cache 复用到 APPS，或反过来复用。
 
 - `--embedding-dtype`
   - `float16` 更省空间，`float32` 更稳妥。

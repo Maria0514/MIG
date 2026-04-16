@@ -226,8 +226,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional experiment config for task-aware generation defaults.",
     )
 
-    parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-V3.2")
-    parser.add_argument("--base-url", type=str, default="https://api.siliconflow.cn/v1")
+    parser.add_argument("--model", type=str, default="nvidia/openai/gpt-oss-120b")
+    parser.add_argument("--base-url", type=str, default="https://inference-api.nvidia.com")
     parser.add_argument("--api-key-env", type=str, default="SILICONFLOW_API_KEY")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
 
@@ -255,16 +255,16 @@ def parse_args() -> argparse.Namespace:
         help="Override max_tokens for every request. <=0 means use prompt/config task defaults.",
     )
     parser.add_argument("--timeout-s", type=float, default=120.0)
-    parser.add_argument("--retry", type=int, default=2)
-    parser.add_argument("--retry-backoff-s", type=float, default=2.0)
+    parser.add_argument("--retry", type=int, default=5)
+    parser.add_argument("--retry-backoff-s", type=float, default=8.0)
     parser.add_argument("--sleep-after-s", type=float, default=0.0)
 
-    parser.add_argument("--parallelism", type=int, default=4, help="Concurrent worker count.")
-    parser.add_argument("--rate-limit-qps", type=float, default=1.0, help="Token bucket refill rate (requests/sec).")
+    parser.add_argument("--parallelism", type=int, default=1, help="Concurrent worker count.")
+    parser.add_argument("--rate-limit-qps", type=float, default=0.3, help="Token bucket refill rate (requests/sec).")
     parser.add_argument(
         "--bucket-capacity",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Token bucket burst capacity (tokens).",
     )
 

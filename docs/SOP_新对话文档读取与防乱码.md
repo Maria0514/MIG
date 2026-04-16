@@ -35,8 +35,9 @@ cd D:\study\MIG
 3. `docs/评测方案.md`
 4. `docs/设计文档.md`
 5. `docs/MIG_标签图操作指南.md`
-6. `docs/历史实验与设计归档.md`（仅在需要历史追溯时）
-7. `docs/文档同步规范.md`（仅在需要回写 docs 时）
+6. `docs/轻量标签器重构方案.md`（仅在需要重构 query / demo 打标时）
+7. `docs/历史实验与设计归档.md`（仅在需要历史追溯时）
+8. `docs/文档同步规范.md`（仅在需要回写 docs 时）
 
 说明：
 
@@ -45,6 +46,7 @@ cd D:\study\MIG
 - `评测方案.md` 决定“评测协议和命令解释”
 - `设计文档.md` 只负责理论
 - `MIG_标签图操作指南.md` 只负责运行手册
+- `轻量标签器重构方案.md` 只在需要调整当前标签策略时再读
 - `历史实验与设计归档.md` 只在需要解释旧命令、旧结果或设计演化时再读
 - `文档同步规范.md` 只在需要把进展同步回 docs 时再读
 
@@ -58,6 +60,7 @@ Get-Content docs\ICL_OpenHermes_TODO.md -Encoding UTF8
 Get-Content docs\评测方案.md -Encoding UTF8
 Get-Content docs\设计文档.md -Encoding UTF8
 Get-Content docs\MIG_标签图操作指南.md -Encoding UTF8
+Get-Content docs\轻量标签器重构方案.md -Encoding UTF8
 Get-Content docs\历史实验与设计归档.md -Encoding UTF8
 ```
 
@@ -185,7 +188,7 @@ AI 在生成运行命令前，必须先读：
 禁止做法：
 
 - 只看一条旧命令就直接复制运行
-- 不区分 HumanEval 与 APPS 就复用 `--queries / --prompt-task / --max-tokens`
+- 不区分 HumanEval 与 APPS 就复用 `--queries / --prompt-task`
 - 把调试参数 `--query-limit / --pool-limit` 带到正式全量运行
 
 ---
